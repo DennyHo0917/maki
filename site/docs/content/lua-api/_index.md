@@ -3986,7 +3986,7 @@ parser language for a given filetype later with `get_lang()`.
 **Example:**
 
 ```lua
-maki.treesitter.language.register("typescript", { "ts", "tsx" })
+maki.treesitter.language.register("tsx", { "tsx", "jsx" })
 ```
 
 ---
@@ -4010,8 +4010,8 @@ a grammar with that name exists. Returns nil when nothing matches.
 **Example:**
 
 ```lua
-local lang = maki.treesitter.language.get_lang("tsx")
-if lang then print(lang) end -- "typescript"
+maki.treesitter.language.register("tsx", { "tsx", "jsx" })
+local lang = maki.treesitter.language.get_lang("jsx") -- "tsx"
 ```
 
 ---
@@ -4033,8 +4033,8 @@ Returns all filetypes that have been registered for {lang}.
 **Example:**
 
 ```lua
-local fts = maki.treesitter.language.get_filetypes("typescript")
--- { "ts", "tsx" }
+local fts = maki.treesitter.language.get_filetypes("tsx")
+-- { "tsx", "jsx" }
 ```
 
 ---

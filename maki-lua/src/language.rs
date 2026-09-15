@@ -5,6 +5,7 @@ pub enum Language {
     Rust,
     Python,
     TypeScript,
+    Tsx,
     JavaScript,
     Gleam,
     Go,
@@ -43,6 +44,7 @@ impl Language {
             "rust" => Some(Self::Rust),
             "python" => Some(Self::Python),
             "typescript" => Some(Self::TypeScript),
+            "tsx" => Some(Self::Tsx),
             "javascript" => Some(Self::JavaScript),
             "gleam" => Some(Self::Gleam),
             "go" => Some(Self::Go),
@@ -81,8 +83,9 @@ impl Language {
         match ext {
             "rs" => Some(Self::Rust),
             "py" | "pyi" => Some(Self::Python),
-            "ts" | "tsx" => Some(Self::TypeScript),
-            "js" | "jsx" | "mjs" | "cjs" => Some(Self::JavaScript),
+            "ts" => Some(Self::TypeScript),
+            "tsx" | "jsx" => Some(Self::Tsx),
+            "js" | "mjs" | "cjs" => Some(Self::JavaScript),
             "gleam" => Some(Self::Gleam),
             "go" => Some(Self::Go),
             "html" | "htm" => Some(Self::Html),
@@ -121,6 +124,7 @@ impl Language {
             Self::Rust => tree_sitter_rust::LANGUAGE.into(),
             Self::Python => tree_sitter_python::LANGUAGE.into(),
             Self::TypeScript => tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
+            Self::Tsx => tree_sitter_typescript::LANGUAGE_TSX.into(),
             Self::JavaScript => tree_sitter_javascript::LANGUAGE.into(),
             Self::Gleam => tree_sitter_gleam::LANGUAGE.into(),
             Self::Go => tree_sitter_go::LANGUAGE.into(),
@@ -152,5 +156,48 @@ impl Language {
             Self::Json => tree_sitter_json::LANGUAGE.into(),
             Self::Make => tree_sitter_make::LANGUAGE.into(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use test_case::test_case;
+    use tree_sitter::Parser;
+
+    use super::Language;
+
+    const JSX_SOURCE: &str = "export const x = <T a={<B c={d} />} />;";
+    const TYPE_ASSERTION_SOURCE: &str = "const x = <T>y;";
+
+    fn parses_cleanly(lang: Language, source: &str) -> bool {
+        let mut parser = Parser::new();
+        parser.set_language(&lang.ts_language()).unwrap();
+        !parser.parse(source, None).unwrap().root_node().has_error()
+    }
+
+    #[test_case("tsx")]
+    #[test_case("jsx")]
+    #[test_case("js")]
+    fn extension_parses_jsx(ext: &str) {
+        assert!(parses_cleanly(
+            Language::from_extension(ext).unwrap(),
+            JSX_SOURCE
+        ));
+    }
+
+    #[test]
+    fn tsx_name_parses_jsx() {
+        assert!(parses_cleanly(
+            Language::from_name("tsx").unwrap(),
+            JSX_SOURCE
+        ));
+    }
+
+    // The TSX grammar reads `<T>` as an unclosed tag, so this also pins down
+    // that .ts never gets routed there.
+    #[test]
+    fn ts_extension_keeps_type_assertions() {
+        let ts = Language::from_extension("ts").unwrap();
+        assert!(parses_cleanly(ts, TYPE_ASSERTION_SOURCE));
     }
 }

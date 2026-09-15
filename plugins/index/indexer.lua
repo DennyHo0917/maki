@@ -1,15 +1,16 @@
 local FIELD_TRUNCATE_THRESHOLD = 8
 local LINE_WRAP_THRESHOLD = 120
 local MAX_INT = math.maxinteger or (2 ^ 53)
+local PARSE_ERROR_NOTE = "(no entries: file has syntax errors - use the read tool instead)"
 
 local EXT_TO_LANG = {
   rs = "rust",
   py = "python",
   pyi = "python",
   ts = "typescript",
-  tsx = "typescript",
+  tsx = "tsx",
   js = "javascript",
-  jsx = "javascript",
+  jsx = "tsx",
   mjs = "javascript",
   cjs = "javascript",
   gleam = "gleam",
@@ -72,9 +73,12 @@ local FILENAME_TO_LANG = {
   ["Makefile"] = "make",
 }
 
+-- JavaScript goes through the TSX grammar because that grammar is a superset
+-- of JavaScript and handles JSX. The one thing it gives up is the `<T>expr`
+-- type assertion, and that is TypeScript only, so a .js file never has one.
 local LANG_TO_PARSER = {
   lua_lang = "lua",
-  javascript = "typescript",
+  javascript = "tsx",
   bazel_build = "starlark",
   bazel_module = "starlark",
   bazel_bzl = "starlark",
@@ -852,6 +856,7 @@ end
 
 local LANG_ALIASES = {
   javascript = "typescript",
+  tsx = "typescript",
 }
 
 local KNOWN_LANGS = {}
@@ -896,7 +901,13 @@ local function index_source(source, lang_name)
   end
   local parser = maki.treesitter.get_parser(source, parser_name(lang_name))
   local root = parser:parse()[1]:root()
-  return extractor(source, root)
+  local skeleton, meta = extractor(source, root)
+  -- An empty skeleton reads as "this file declares nothing", and that is the
+  -- wrong story to tell when the parser choked on the file instead.
+  if skeleton == "" and root:has_error() then
+    skeleton = PARSE_ERROR_NOTE .. "\n"
+  end
+  return skeleton, meta
 end
 
 local LANG_TO_EXT = {}
@@ -912,4 +923,5 @@ return {
   LANG_TO_EXT = LANG_TO_EXT,
   FILENAME_TO_LANG = FILENAME_TO_LANG,
   TRUNCATED_SUFFIX = TRUNCATED_SUFFIX,
+  PARSE_ERROR_NOTE = PARSE_ERROR_NOTE,
 }

@@ -238,7 +238,7 @@ Return a compact overview of a source file: imports, type definitions, function 
       return { llm_output = "error: " .. tostring(line_meta), is_error = true }
     end
 
-    local ext = indexer.LANG_TO_EXT[lang] or path:match("%.([^%.]+)$") or ""
+    local ext = path:match("%.([^%.]+)$") or indexer.LANG_TO_EXT[lang] or ""
     local buf, header = render_index(skeleton, path, ctx, ext, line_meta)
     return {
       llm_output = skeleton:gsub("\n+$", ""),

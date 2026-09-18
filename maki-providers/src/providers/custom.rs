@@ -1,47 +1,19 @@
 use std::sync::{Arc, Mutex};
 
-use flume::Sender;
-use serde_json::Value;
-
 use maki_config::providers::{
     Protocol, ProviderDef, ProvidersConfig, resolve_api_key_env, resolve_base_url, resolve_protocol,
 };
-use maki_storage::id::SessionRef;
 use tracing::warn;
 
 use super::ResolvedAuth;
 use super::anthropic::shared;
 use super::catalog;
-use super::openai::responses;
-use super::openai_compat::{OpenAiCompatConfig, OpenAiCompatProvider};
+use super::codec::protocol_spec;
+use crate::AgentError;
 use crate::model::{FastPricing, Model, ModelInfo, ModelPricing, ModelTier, ThinkingSupport};
-use crate::provider::{BoxFuture, Provider};
+use crate::provider::Provider;
 use crate::providers::Timeouts;
 use crate::spec::{ProviderRegistry, ProviderSpec};
-use crate::types::ThinkingFallback;
-use crate::{AgentError, Message, ProviderEvent, RequestOptions, StreamResponse};
-
-static CUSTOM_OPENAI_CONFIG: OpenAiCompatConfig = OpenAiCompatConfig {
-    // Custom providers resolve their own base URL (including any override) from
-    // config, so the compat-layer fallback slug is unused here.
-    slug: "",
-    api_key_env: "",
-    base_url: "",
-    max_tokens_field: "max_tokens",
-    include_stream_usage: true,
-    provider_name: "custom",
-};
-
-/// The native provider a custom slug borrows its codec and fallbacks from.
-/// Resolved through [`ProviderRegistry::get`], never `for_slug`, so the lookup
-/// cannot recurse back into here.
-fn protocol_spec(protocol: Protocol) -> Option<&'static ProviderSpec> {
-    ProviderRegistry::get(match protocol {
-        Protocol::Openai | Protocol::OpenaiResponses => super::openai::SLUG,
-        Protocol::Anthropic => super::anthropic::SLUG,
-        Protocol::Google => super::google::SLUG,
-    })
-}
 
 /// Builtins win their slug in `from_spec`/`create`, so every custom path skips
 /// them. Key off the spec (every builtin), not `builtin_provider`, which
@@ -82,17 +54,7 @@ pub fn create(slug: &str, timeouts: Timeouts) -> Result<Box<dyn Provider>, Agent
     let resolved = resolve_custom_auth(slug)?;
     let auth = Arc::new(Mutex::new(resolved));
 
-    match protocol {
-        Protocol::Anthropic => Ok(Box::new(super::anthropic::Anthropic::with_auth(
-            auth, timeouts,
-        ))),
-        Protocol::Openai | Protocol::OpenaiResponses => Ok(Box::new(CustomOpenAiProvider {
-            compat: OpenAiCompatProvider::new(&CUSTOM_OPENAI_CONFIG, timeouts),
-            auth,
-            protocol,
-        })),
-        Protocol::Google => Ok(Box::new(super::google::Google::with_auth(auth, timeouts))),
-    }
+    Ok(super::codec::build(protocol, auth, timeouts, None, None))
 }
 
 pub fn lookup_model(slug: &str, model_id: &str) -> Option<Model> {
@@ -331,63 +293,14 @@ fn overlay_declared_tiers(def: &ProviderDef, models: &mut [ModelInfo]) {
     }
 }
 
-struct CustomOpenAiProvider {
-    compat: OpenAiCompatProvider,
-    auth: Arc<Mutex<ResolvedAuth>>,
-    protocol: Protocol,
-}
-
-impl Provider for CustomOpenAiProvider {
-    fn stream_message<'a>(
-        &'a self,
-        model: &'a Model,
-        messages: &'a [Message],
-        system: &'a str,
-        tools: &'a Value,
-        event_tx: &'a Sender<ProviderEvent>,
-        opts: RequestOptions,
-        _session_id: Option<&'a SessionRef>,
-    ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
-        Box::pin(async move {
-            let auth = self.auth.lock().unwrap().clone();
-
-            if self.protocol == Protocol::OpenaiResponses {
-                let body = responses::build_body(model, messages, system, tools);
-                // TODO: wire thinking budget into responses API when llama.cpp supports it
-                return responses::do_stream(
-                    self.compat.client(),
-                    model,
-                    &body,
-                    event_tx,
-                    &auth,
-                    self.compat.stream_timeout(),
-                )
-                .await;
-            }
-
-            let mut body = self.compat.build_body(model, messages, system, tools);
-            opts.thinking
-                .apply_thinking(&mut body, model, ThinkingFallback::None);
-            self.compat
-                .do_stream(model, &[], &body, event_tx, &auth)
-                .await
-        })
-    }
-
-    fn list_models(&self) -> BoxFuture<'_, Result<Vec<crate::model::ModelInfo>, AgentError>> {
-        let auth = self.auth.lock().unwrap().clone();
-        Box::pin(async move { self.compat.do_list_models(&auth).await })
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use maki_storage::sessions::Effort::High;
-    use serde_json::json;
+    use serde_json::{Value, json};
     use test_case::test_case;
 
     use super::*;
-    use crate::types::ThinkingConfig;
+    use crate::types::{ThinkingConfig, ThinkingFallback};
 
     const FIELDS_MODEL: &str =
         r#"{"id":"m","thinking_fields":{"high":{"reasoning_effort":"xhigh"}}}"#;

@@ -38,6 +38,7 @@ use maki_storage::id::{MakiId, SessionRef};
 use crate::api::autocmd::AutocmdStore;
 use crate::api::create_maki_global;
 use crate::api::r#fn::{JobEvent, JobOwner, JobStore, deliver_job_event};
+use crate::api::fs::publish_walks;
 use crate::api::keymap::KeymapReader;
 use crate::api::keymap::{KeymapStore, KeymapWriter};
 use crate::api::options::{PluginOptionSpecs, PluginOpts, collect_plugin_options};
@@ -64,6 +65,7 @@ use crate::api::util::ctx::{LuaCtx, RestoreCtx};
 use crate::api::util::setup::ConfigStore;
 use crate::docs_render;
 use crate::error::PluginError;
+use crate::loader::EventHandle;
 use crate::plugin_permissions::{PluginPermissions, load_plugin_permissions};
 
 const INTERRUPT_SHUTDOWN_MSG: &str = "plugin interrupted: host shutting down";
@@ -2588,6 +2590,7 @@ impl LuaRuntime {
             queue.cancel_plugin(plugin);
         }
         crate::api::top::clear_notify_handler(&self.lua, plugin);
+        crate::api::fs::clear_plugin_files(plugin);
         let revision_guard = self.drop_plugin_keys(plugin);
         with_packs(&self.lua, |packs| packs.active.remove(plugin));
         if let Some(mut store) = self.lua.app_data_mut::<KeymapStore>() {
@@ -3577,6 +3580,9 @@ pub fn spawn(
     let (command_writer, command_reader) = LuaCommandWriter::new();
     let (keymap_writer, keymap_reader) = KeymapWriter::new();
     let (hint_writer, hint_reader) = HintWriter::new();
+    // The file index outlives any one plugin host, so the walks a host
+    // rebuilt by `/reload` is waiting on are the ones the old host started.
+    publish_walks(EventHandle::from_tx(tx.clone()));
 
     let handle = thread::Builder::new()
         .name("maki-lua".to_owned())

@@ -75,6 +75,9 @@ pub fn run(params: EventLoopParams, initial_prompt: Option<String>) -> Result<Ru
         let el = event_loop::EventLoop::new(&mut terminal, params)?;
         el.run(initial_prompt)?
     };
+    // Nothing is going to ask for a file list after the last frame, and a walk
+    // of a large tree has no business burning cores through teardown.
+    maki_agent::cancel_walks();
     let event_loop::ShutdownReport {
         exit,
         tabs,

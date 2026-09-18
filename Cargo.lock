@@ -2739,6 +2739,7 @@ dependencies = [
  "maki-otel",
  "maki-providers",
  "maki-storage",
+ "nucleo-matcher",
  "open",
  "serde",
  "serde_json",
@@ -2753,6 +2754,7 @@ dependencies = [
  "toml",
  "toml_edit 0.22.27",
  "tracing",
+ "unicode-segmentation",
  "url",
 ]
 
@@ -3026,7 +3028,6 @@ dependencies = [
  "flume 0.11.1",
  "futures-lite",
  "getrandom 0.3.4",
- "ignore",
  "image",
  "jiff",
  "libc",
@@ -3055,6 +3056,7 @@ dependencies = [
  "test-case",
  "toml",
  "tracing",
+ "unicode-segmentation",
  "unicode-width",
  "wait-timeout",
  "windows-sys 0.61.2",

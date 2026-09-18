@@ -61,7 +61,10 @@ pub(crate) fn create_maki_global(
     slot::add_slot_methods(&api, lua, Arc::clone(&plugin))?;
     maki.set("api", api)?;
     maki.set("env", env::create_env_table(lua, permissions)?)?;
-    maki.set("fs", fs::create_fs_table(lua, permissions)?)?;
+    maki.set(
+        "fs",
+        fs::create_fs_table(lua, permissions, Arc::clone(&plugin))?,
+    )?;
     maki.set("log", log::create_log_table(lua, Arc::clone(&plugin))?)?;
     maki.set("treesitter", treesitter::create_treesitter_table(lua)?)?;
     maki.set("uv", uv::create_uv_table(lua, permissions)?)?;

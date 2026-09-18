@@ -772,10 +772,12 @@ Built-in events fired by the host: `"TurnStart"`, `"TurnEnd"`,
 `"TurnError"`, `"ToolStart"`, `"ToolDone"`, `"AutoCompacting"`,
 `"CompactionDone"`, `"PlanReady"`, `"SessionReset"`, `"SessionEnd"`,
 `"SessionFocusChanged"`, `"SessionStatusChanged"`, `"TaskStatusChanged"`,
-`"TaskFocusChanged"`, `"ModelChanged"`, and `"InputChanged"`. Plugins can
-also fire their own events with `exec_autocmds`.
+`"TaskFocusChanged"`, `"ModelChanged"`, `"InputChanged"`, and
+`"FileIndexReady"`. Plugins can also fire their own events with
+`exec_autocmds`.
 
-Every host event carries `data.session_id`. For `"SessionReset"` and
+Every host event carries `data.session_id` except `"FileIndexReady"`,
+which is about a directory rather than a session. For `"SessionReset"` and
 `"SessionEnd"` that is the session being left behind, the other events
 name the session now running or focused. What each event adds:
 
@@ -816,6 +818,16 @@ name the session now running or focused. What each event adds:
   change. At most one event per frame and only when the text moved, so
   moving the cursor alone fires nothing. Focusing another session
   republishes the input that tab holds.
+- `"FileIndexReady"`: `data.root`, the absolute directory that was
+  walked, `data.files`, how many paths the walk left, and `data.crashed`
+  and `data.truncated`, the two ways that list is not the whole tree.
+  Fires once per walk that ends, whatever `maki.fs.fuzzy_files` or the
+  `Ctrl+S` picker started it, so a plugin ranking files asks again
+  instead of polling. A walk cancelled before it ended stays quiet.
+  `data.root` is absent for a directory with no UTF-8 spelling, and so is
+  the `root` of the call that asked for the walk, so a plugin matching
+  the two takes an event without a root as a reason to ask again. Asking
+  again only ever re-reads the root the plugin passed.
 
 `"TurnEnd"` fires once per turn and only for the main session, so
 subagent turns never show up. A manual `/compact` ends its run without
@@ -2755,7 +2767,12 @@ maki.fs.mkdir("a/b/c", { parents = true })
 maki.fs.glob({pattern}, {opts?})
 ```
 
-Find files matching one or more glob patterns.
+Find files matching one or more glob patterns, walked fresh on every call.
+
+Reads any path the plugin is allowed to read and keeps nothing afterwards.
+`maki.fs.fuzzy_files` ranks a walk the host caches instead, which is
+cheaper per keystroke but only covers the current working directory.
+
 Respects `.gitignore` by default. Pass `sort = "mtime"` to get the most
 recently modified files first.
 
@@ -2811,6 +2828,74 @@ for _, file in ipairs(hits) do
     end
   end
 end
+```
+
+---
+
+### `maki.fs.fuzzy_files()` {#maki-fs-fuzzy_files}
+
+```lua
+maki.fs.fuzzy_files({opts?})
+```
+
+Rank the files and directories under {opts.path} against {opts.query} and
+return the best ones, best first, with the state of the walk behind them.
+
+The host walks each root once and shares that walk with the built-in file
+picker (`Ctrl+S`), so a call ranks an existing list instead of walking the
+tree, and both rank alike. Use `maki.fs.glob` for patterns, a path outside
+the cwd, or a tree read fresh right now. Only `limit` items ever cross into
+Lua whatever the size of the repo, paths come back relative to the root
+with a trailing separator on the directories, and `.gitignore` and `.git`
+are respected. `highlights` cost a second matcher pass, so ask for them
+only to draw matches.
+
+`complete` is false while a walk is filling the list, so an empty `items`
+means "not found yet" and asking again is worth it. maki walks a bounded
+number of trees at once, so a first call can also answer before the walk it
+asked for has started. `crashed` and `truncated` are the two ways a
+complete list is still not the whole tree: a walker that died partway
+through it, and a tree bigger than the host's ceiling. Listen for
+`"FileIndexReady"` with `maki.api.create_autocmd` to be told when a walk
+lands rather than polling for it.
+
+The tools that write, move and delete files mark the tree they touched, so
+a call a moment after an edit re-walks and a file the agent just wrote is
+findable. A file a `bash` command creates or deletes is not: a shell
+command cannot say what it touched, and maki does not try to guess. That
+leaves the staleness window as the only guarantee, and it is this: a walk
+is redone the first time anything asks for the index more than twenty
+seconds after the last one landed, so a path may be missing from the list,
+or offered after it is gone, for up to twenty seconds.
+
+A second call from the same plugin cancels the one in flight, which answers
+with nil plus an error. While the user types that is expected, so treat the
+error as a stale answer. A plugin reading more than four roots keeps the
+four it asked for most recently: the walk behind an older one is let go and
+asking for it again walks it again.
+
+Requires the `fs_read` [plugin permission](#plugin-permissions).
+
+**Parameters:**
+
+- `{opts?}` (`table?`) Options:
+  - `query` (`string`) what the user typed. Empty returns the first `limit` paths in walk order.
+  - `limit` (`integer`) how many items to return, at most 500. Default 20.
+  - `path` (`string`) the root to search, the cwd or below it. Default is the current working directory.
+  - `highlights` (`boolean`) also return where the query matched each path. Default false.
+
+**Returns:** (`table?`, `string?`) `{ root = string, complete = boolean, crashed = boolean, truncated = boolean, items = { { path = string, highlights = integer[][]? } } }`, or nil plus an error message. `root` is the resolved absolute directory the paths are relative to, spelled the way `"FileIndexReady"` spells it, so an event can be matched to the call that caused it. It is absent for a directory with no UTF-8 spelling, as it is on the event, so a plugin that gets no `root` treats every event as a reason to ask again rather than matching the wrong tree. `items` is a 1-based array, best first. `highlights` is only present when asked for, and holds `{ from, to }` byte ranges of `path`, ascending, 1-based and inclusive, so `path:sub(from, to)` is the matched text.
+
+**Example:**
+
+```lua
+local res, err = maki.fs.fuzzy_files({ query = "src/mai", limit = 20, highlights = true })
+if err then return end -- a newer call took over, this answer is stale
+for _, item in ipairs(res.items) do
+  local r = item.highlights[1]
+  print(item.path, r and item.path:sub(r[1], r[2]))
+end
+if not res.complete then print("still scanning, ask again") end
 ```
 
 

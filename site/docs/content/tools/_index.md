@@ -20,6 +20,7 @@ Commands run in <cwd> by default.
 |-----------|------|----------|---------|-------------|
 | `command` | string | yes |  | The bash command to execute |
 | `description` | string | no |  | Short description (3-5 words) of what the command does |
+| `tail` | integer | no |  | Return only the last N lines |
 | `timeout` | integer | no | 120 | Timeout in seconds |
 | `workdir` | string | no | cwd | Working directory |
 

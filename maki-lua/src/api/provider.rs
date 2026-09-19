@@ -7,11 +7,11 @@ use std::time::Duration;
 
 use maki_config::providers::Protocol;
 use maki_lua_macro::{lua_fn, lua_table};
-use maki_providers::AgentError;
 use maki_providers::plugin::{
     self, DeclSource, Hook, PluginModel, ProviderDecl, ProviderHooks, Registration,
 };
 use maki_providers::provider::BoxFuture;
+use maki_providers::{AgentError, EffortDialect};
 use maki_storage::StateDir;
 use maki_storage::auth::{
     delete_plugin_auth, load_plugin_auth, lock_credentials, save_plugin_auth,
@@ -51,6 +51,9 @@ const BASE: &str = "base";
 const BASE_URL: &str = "base_url";
 const API_KEY_ENV: &str = "api_key_env";
 const SYSTEM_PREFIX: &str = "system_prefix";
+const MAX_TOKENS_FIELD: &str = "max_tokens_field";
+const INCLUDE_STREAM_USAGE: &str = "include_stream_usage";
+const THINKING_DIALECT: &str = "thinking_dialect";
 const MODELS: &str = "models";
 
 const BODY_FIELD: &str = "body";
@@ -460,17 +463,31 @@ fn owned(slugs: &OwnedSlugs, slug: &str) -> LuaResult<()> {
 /// {spec} fields:
 ///   `slug` (string) Required. How the provider is addressed: `<slug>/<model>`.
 ///           Letters, digits, `_` and `-`, starting with a letter or digit, and
-///           not a slug a built-in or `providers.toml` already owns.
-///   `display_name` (string) Required. Shown in the UI.
+///           not a slug `providers.toml` already owns. A built-in slug may be
+///           claimed: the decl then inherits `display_name`, `api_key_env`,
+///           the curated model table and pricing from the built-in, so
+///           restating any of those is an error rather than an override.
+///   `display_name` (string) Required, except for a decl claiming a built-in
+///           slug. Shown in the UI.
 ///   `codec` (string) `"openai"`, `"openai-responses"`, `"anthropic"` or
 ///           `"google"`. Mutually exclusive with `base`.
 ///   `base` (string) A native provider slug to build on, e.g. `"anthropic"`.
-///   `base_url` (string) Default origin for requests. Its host must be one of
-///           the declared `net_hosts`, and it must be `https` unless it points
-///           at loopback.
+///   `base_url` (string) Last-resort origin for requests: `<SLUG>_BASE_URL`
+///           and `providers.toml` both outrank it, and an origin an auth hook
+///           returns outranks those. Its host must be one of the declared
+///           `net_hosts`, and it must be `https` unless it points at loopback.
 ///   `api_key_env` (string) Environment variable holding an API key. Read at
 ///           registration and sent as a bearer token when set.
 ///   `system_prefix` (string) Text prepended to the system prompt.
+///   `max_tokens_field` (string) Body field carrying the output cap. Defaults
+///           to `max_tokens`.
+///   `include_stream_usage` (boolean) Whether to ask for usage on the stream.
+///           Defaults to `true`.
+///   `thinking_dialect` (string) Names the provider's effort dialect, one of
+///           `"standard"`, `"codex"`, `"codex-5-1"`, `"coding-plan"`,
+///           `"gpt-5-6"`, `"gpt-6"`, `"prefer-high"`, `"high-only"`, `"glm"`,
+///           `"deepseek"`, `"anthropic-adaptive"`, `"tensorx"`, `"grok"` or
+///           `"ollama"`. Omitting it sends no effort field.
 ///   `models` (table) List of model rows. Each row has `prefixes` (list): the
 ///            row answers for every model id starting with one of them,
 ///            longest prefix first, and `prefixes[1]` is the canonical id.
@@ -562,9 +579,9 @@ fn register(
                 base_url: optional(&spec, BASE_URL)?,
                 api_key_env: optional(&spec, API_KEY_ENV)?,
                 system_prefix: optional(&spec, SYSTEM_PREFIX)?,
-                max_tokens_field: None,
-                include_stream_usage: None,
-                thinking_dialect: None,
+                max_tokens_field: optional(&spec, MAX_TOKENS_FIELD)?,
+                include_stream_usage: optional_bool(&spec, INCLUDE_STREAM_USAGE)?,
+                thinking_dialect: dialect(&spec, &slug)?,
                 models: models(lua, &spec)?,
                 net_hosts: hosts.to_vec(),
             },
@@ -598,6 +615,12 @@ fn optional(spec: &Table, key: &str) -> LuaResult<Option<String>> {
     })
 }
 
+fn optional_bool(spec: &Table, key: &str) -> LuaResult<Option<bool>> {
+    spec.get::<Option<bool>>(key).map_err(|_| {
+        mlua::Error::runtime(format!("maki.provider.register: '{key}' must be a boolean"))
+    })
+}
+
 /// The registry holds protocols, not names, and has no parser: a codec nobody
 /// implements is caught here, where the plugin that wrote it can be named.
 fn codec(spec: &Table) -> LuaResult<Option<Protocol>> {
@@ -609,6 +632,17 @@ fn codec(spec: &Table) -> LuaResult<Option<Protocol>> {
                      openai-responses, anthropic, google)"
                 ))
             })
+        })
+        .transpose()
+}
+
+/// The dialect table lives in the registry, so a name nobody implements is
+/// caught here, where the plugin that wrote it can be named.
+fn dialect(spec: &Table, slug: &str) -> LuaResult<Option<&'static EffortDialect<'static>>> {
+    optional(spec, THINKING_DIALECT)?
+        .map(|name| {
+            plugin::thinking_dialect(slug, &name)
+                .map_err(|e| mlua::Error::runtime(format!("maki.provider.register: {e}")))
         })
         .transpose()
 }
@@ -982,6 +1016,38 @@ mod tests {
         let spec = lua.create_table().unwrap();
         spec.set(CODEC, name).unwrap();
         assert!(codec(&spec).unwrap().is_some(), "{name}");
+    }
+
+    /// The doc comment spells the dialect names out as a closed set, so a name
+    /// added to or dropped from the registry has to be spelled again there.
+    #[test]
+    fn every_dialect_name_is_documented() {
+        let documented = DOCS.fns.iter().find(|f| f.name == "register").unwrap().desc;
+        for name in maki_providers::dialect::NAMES {
+            assert!(documented.contains(&format!("`\"{name}\"`")), "{name}");
+        }
+    }
+
+    #[test]
+    fn every_dialect_name_resolves() {
+        let lua = Lua::new();
+        let spec = lua.create_table().unwrap();
+        for name in maki_providers::dialect::NAMES {
+            spec.set(THINKING_DIALECT, *name).unwrap();
+            assert!(dialect(&spec, SLUG_NAME).unwrap().is_some(), "{name}");
+        }
+    }
+
+    #[test]
+    fn an_unknown_dialect_is_refused_where_the_plugin_can_be_named() {
+        let lua = Lua::new();
+        let spec = lua.create_table().unwrap();
+        spec.set(THINKING_DIALECT, "esperanto").unwrap();
+        let error = dialect(&spec, SLUG_NAME).unwrap_err().to_string();
+        assert!(
+            error.contains("unknown thinking dialect 'esperanto'"),
+            "{error}"
+        );
     }
 
     #[test]

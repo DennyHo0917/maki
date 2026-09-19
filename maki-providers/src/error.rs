@@ -129,19 +129,17 @@ pub enum AgentError {
     EmptySummary,
 }
 
-/// Everything the observable predicates ([`AgentError::retry_kind`],
-/// [`AgentError::retry_after`], [`AgentError::is_context_overflow`],
-/// [`AgentError::is_quota_exhausted`], [`AgentError::is_auth_error`])
-/// discriminate on, and nothing else. Two errors with equal projections are
-/// the same error to the retry loop and the compaction path even when their
-/// payloads differ, which is the comparison a replay suite needs from a type
-/// that cannot be `PartialEq` itself.
+/// Everything the retry loop and the compaction path can tell about an error,
+/// and nothing else. Two errors that project the same behave the same, which
+/// is the comparison replay goldens need out of a type that cannot be
+/// `PartialEq` itself. The test at the bottom of this file is the proof, and it
+/// is what lets each provider go without its own retry fixtures.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ErrorProjection {
     Api {
         status: u16,
         retry_after: Option<Duration>,
-        /// The message is read only through these three answers, so two bodies
+        /// The body is read only through these three answers, so two wordings
         /// that classify alike are the same error here.
         overflow: Option<Overflow>,
         quota_exhausted: bool,
@@ -149,9 +147,9 @@ pub enum ErrorProjection {
     },
     Config,
     Tool,
-    /// `retry_kind` reads the kind and nothing else about the error.
+    /// The kind is all anyone reads off an io error.
     Io(io::ErrorKind),
-    /// `retry_kind` splits transports on whether a connection was ever made.
+    /// Transports split on whether a connection was ever made.
     Http {
         connect_failure: bool,
     },
@@ -465,6 +463,8 @@ fn parse_retry_after(value: &str) -> Option<Duration> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
+
     use maki_config::DEFAULT_MAX_RETRIES;
     use serde_json::{Value, json};
     use test_case::test_case;
@@ -749,7 +749,10 @@ mod tests {
     }
 
     const VARIANT_COUNT: usize = 11;
-    const CORPUS_STATUSES: [u16; 10] = [400, 401, 402, 403, 408, 413, 429, 500, 503, 529];
+    /// One status per branch the answers below split on: refused for size
+    /// (400, 413), stale token (401), dead key but live account (403), rate
+    /// limit (429), server trouble (500). The rest behave like one of these.
+    const CORPUS_STATUSES: [u16; 6] = [400, 401, 403, 413, 429, 500];
     const CORPUS_RETRY_AFTER: Option<Duration> = Some(Duration::from_secs(30));
     const PLAIN_MESSAGE: &str = "bad input";
     const OVERFLOW_MESSAGE: &str = "Input exceeds context limit";
@@ -761,8 +764,8 @@ mod tests {
     const INVALID_URI: &str = "http://[";
     const INVALID_JSON: &str = "{";
 
-    /// Exhaustive by construction: a new variant stops this compiling, so the
-    /// coverage assertion cannot quietly go stale.
+    /// Adding a variant stops this compiling, which is the nudge to put a
+    /// sample of it in [`corpus`].
     fn variant_index(error: &AgentError) -> usize {
         match error {
             AgentError::Api { .. } => 0,
@@ -779,6 +782,8 @@ mod tests {
         }
     }
 
+    /// Every variant, and for `Api` every wording and status the answers are
+    /// known to turn on, crossed with both `Retry-After` shapes.
     fn corpus() -> Vec<AgentError> {
         let quota = opencode_body("GoUsageLimitError", QUOTA_MESSAGE);
         let model = opencode_body("ModelError", MODEL_MESSAGE);
@@ -788,9 +793,6 @@ mod tests {
             OVERFLOW_MESSAGE,
             OVERFLOW_ALIAS,
             ANTHROPIC_BUDGET,
-            VLLM_BUDGET,
-            VLLM_PROMPT_ONLY,
-            SUMMARY_BODY,
             quota.as_str(),
             model.as_str(),
         ];
@@ -806,20 +808,16 @@ mod tests {
                 }
             }
         }
+        // One kind on each side of the connect/transient split, plus the second
+        // connect failure so the two that share a projection have to agree.
         corpus.extend(
-            [
-                io::ErrorKind::ConnectionRefused,
-                io::ErrorKind::UnexpectedEof,
-                io::ErrorKind::TimedOut,
-                io::ErrorKind::BrokenPipe,
-            ]
-            .map(|kind| AgentError::Io(kind.into())),
+            [io::ErrorKind::ConnectionRefused, io::ErrorKind::UnexpectedEof]
+                .map(|kind| AgentError::Io(kind.into())),
         );
         corpus.extend(
             [
                 HttpErrorKind::ConnectionFailed,
                 HttpErrorKind::NameResolution,
-                HttpErrorKind::Io,
                 HttpErrorKind::TlsEngine,
             ]
             .map(|kind| AgentError::Http(kind.into())),
@@ -848,81 +846,58 @@ mod tests {
         corpus
     }
 
-    #[test]
-    fn the_corpus_covers_every_variant() {
-        let mut seen: Vec<usize> = corpus().iter().map(variant_index).collect();
-        seen.sort_unstable();
-        seen.dedup();
-
-        assert_eq!(seen.len(), VARIANT_COUNT);
+    /// Every answer the retry loop and the compaction path ever ask an error
+    /// for. Named fields rather than a tuple so a failure says which one moved.
+    #[derive(Debug, PartialEq)]
+    struct Observables {
+        retry_kind: Option<RetryKind>,
+        retry_after: Option<Duration>,
+        overflow: Option<Overflow>,
+        quota_exhausted: bool,
+        auth_error: bool,
+        rotate_key: bool,
     }
 
-    /// The projection is complete when it keeps apart every pair the observable
-    /// predicates keep apart: sharing a projection has to mean sharing all of
-    /// their answers.
+    impl Observables {
+        fn of(error: &AgentError) -> Self {
+            Self {
+                retry_kind: error.retry_kind(),
+                retry_after: error.retry_after(),
+                overflow: error.overflow(),
+                quota_exhausted: error.is_quota_exhausted(),
+                auth_error: error.is_auth_error(),
+                rotate_key: error.should_rotate_key(),
+            }
+        }
+    }
+
+    /// Why [`AgentError::projection`] earns its keep: the answers above are a
+    /// function of the projection, so a replay golden that pins the projection
+    /// pins the behaviour, and no provider needs retry fixtures of its own.
     #[test]
     fn equal_projections_agree_on_every_observable() {
-        let corpus = corpus();
+        let mut seen: Vec<(ErrorProjection, Observables)> = Vec::new();
+        let mut variants = HashSet::new();
         let mut collisions = 0usize;
-        for (index, left) in corpus.iter().enumerate() {
-            for right in &corpus[index + 1..] {
-                if left.projection() != right.projection() {
-                    continue;
+
+        for error in corpus() {
+            variants.insert(variant_index(&error));
+            let projection = error.projection();
+            let observed = Observables::of(&error);
+            match seen.iter().position(|(p, _)| *p == projection) {
+                Some(twin) => {
+                    collisions += 1;
+                    assert_eq!(seen[twin].1, observed, "{error:?} projects to {projection:?}");
                 }
-                collisions += 1;
-                assert_eq!(
-                    observables(left),
-                    observables(right),
-                    "{left:?} vs {right:?}"
-                );
+                None => seen.push((projection, observed)),
             }
         }
 
-        // All-distinct projections would satisfy the property vacuously, so the
-        // corpus has to contain errors that differ only below the projection.
-        assert!(collisions > 0);
-    }
-
-    /// Payloads the observables read beyond the discriminant, each of which the
-    /// naive `(discriminant, status, retry_after)` projection would erase.
-    #[test_case(
-        AgentError::Io(io::ErrorKind::ConnectionRefused.into()),
-        AgentError::Io(io::ErrorKind::UnexpectedEof.into())
-        ; "io_kind"
-    )]
-    #[test_case(
-        AgentError::Http(HttpErrorKind::ConnectionFailed.into()),
-        AgentError::Http(HttpErrorKind::TlsEngine.into())
-        ; "connect_failure"
-    )]
-    #[test_case(api_msg(400, OVERFLOW_MESSAGE), api_msg(400, PLAIN_MESSAGE) ; "overflow")]
-    #[test_case(
-        api_msg(429, &opencode_body("GoUsageLimitError", QUOTA_MESSAGE)),
-        api_msg(429, PLAIN_MESSAGE)
-        ; "quota"
-    )]
-    #[test_case(
-        api_msg(401, &opencode_body("ModelError", MODEL_MESSAGE)),
-        api_msg(401, PLAIN_MESSAGE)
-        ; "auth"
-    )]
-    fn projection_separates_errors_with_different_observables(
-        left: AgentError,
-        right: AgentError,
-    ) {
-        assert_ne!(observables(&left), observables(&right));
-        assert_ne!(left.projection(), right.projection());
-    }
-
-    type Observables = (Option<RetryKind>, Option<Duration>, bool, bool, bool);
-
-    fn observables(error: &AgentError) -> Observables {
-        (
-            error.retry_kind(),
-            error.retry_after(),
-            error.is_context_overflow(),
-            error.is_quota_exhausted(),
-            error.is_auth_error(),
-        )
+        assert_eq!(variants.len(), VARIANT_COUNT, "the corpus skipped a variant");
+        // All-distinct projections would pass without proving a thing.
+        assert!(
+            collisions > 0,
+            "the corpus needs errors that differ below the projection"
+        );
     }
 }

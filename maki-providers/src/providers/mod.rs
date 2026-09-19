@@ -36,6 +36,8 @@ pub mod opencode;
 pub(crate) mod openrouter;
 pub mod plugin;
 pub(crate) mod regolo;
+#[cfg(test)]
+pub(crate) mod replay;
 pub(crate) mod requesty;
 pub(crate) mod synthetic;
 pub(crate) mod tensorx;

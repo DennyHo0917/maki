@@ -10,53 +10,49 @@ use maki_storage::id::SessionRef;
 use super::ResolvedAuth;
 use super::Timeouts;
 use super::openai::responses;
-use super::openai_compat::{OpenAiCompatConfig, OpenAiCompatProvider};
+use super::openai_compat::{DEFAULT_MAX_TOKENS_FIELD, OpenAiCompatConfig, OpenAiCompatProvider};
 use crate::model::{Model, ModelInfo};
 use crate::provider::{BoxFuture, Provider};
 use crate::spec::{ProviderRegistry, ProviderSpec};
 use crate::types::{EffortDialect, ThinkingFallback};
 use crate::{AgentError, Message, ProviderEvent, RequestOptions, StreamResponse};
 
-/// What a plain openai endpoint takes, and what a declaration that says
-/// nothing gets.
-const DEFAULT_MAX_TOKENS_FIELD: &str = "max_tokens";
-
-/// Everything a provider declaration tells the codec about its wire, in one
-/// struct: the six fields an [`OpenAiCompatConfig`] is made of, plus the three
-/// a declaration may add on top of the protocol. Passed whole so a new option
-/// is a field here rather than another positional argument at two call sites.
+/// Everything a provider declaration tells the codec about its wire: what an
+/// [`OpenAiCompatConfig`] is made of, plus what a declaration adds on top of
+/// the protocol. Passed whole so a new option is one more field here rather
+/// than one more argument at every call site.
 ///
 /// `Cow` throughout because a declaration authored in Rust names `&'static
 /// str` and one authored in Lua owns its strings.
 pub struct CodecOptions {
     pub protocol: Protocol,
-    /// The real slug, never empty: it is what
-    /// [`maki_config::providers::configured_base_url`] keys the user's
-    /// `<SLUG>_BASE_URL` and `providers.toml` origin off.
+    /// Never empty: it is the key
+    /// [`maki_config::providers::configured_base_url`] looks the user's
+    /// `<SLUG>_BASE_URL` and `providers.toml` origin up under.
     pub slug: Cow<'static, str>,
     pub api_key_env: Cow<'static, str>,
-    /// The declaration's *static* origin, and the last resort of the three
+    /// The origin the declaration itself names, and the weakest of the three
     /// (see [`OpenAiCompatProvider::base_url`]): the user's env var and
-    /// `providers.toml` outrank it, and credentials a hook resolved outrank
-    /// those.
+    /// `providers.toml` beat it, and an origin a hook resolved beats those.
     pub base_url: Cow<'static, str>,
     /// `None` is [`DEFAULT_MAX_TOKENS_FIELD`].
     pub max_tokens_field: Option<Cow<'static, str>>,
     /// `None` asks for `stream_options.include_usage`, which every openai
     /// endpoint worth billing for supports.
     pub include_stream_usage: Option<bool>,
-    /// A log label; defaults to the slug.
+    /// A log label, the slug by default.
     pub provider_name: Cow<'static, str>,
     pub system_prefix: Option<String>,
-    /// Set to spell effort the way this provider's API does, which replaces
-    /// the generic thinking pass (see [`CompatProvider::stream_message`]).
+    /// Set it to spell effort the way this provider's API spells it, which
+    /// replaces the generic thinking pass (see
+    /// [`CompatProvider::stream_message`]).
     pub thinking_dialect: Option<&'static EffortDialect<'static>>,
     pub build_body: Option<Arc<dyn BodyHook>>,
 }
 
 impl CodecOptions {
-    /// Everything but the protocol and the slug left as a plain openai
-    /// endpoint behaves, so a caller states only what it differs on.
+    /// Everything but the protocol and the slug behaves as a plain openai
+    /// endpoint, so a caller states only what it differs on.
     pub fn new(protocol: Protocol, slug: impl Into<Cow<'static, str>>) -> Self {
         let slug = slug.into();
         Self {
@@ -96,8 +92,9 @@ pub trait BodyHook: Send + Sync {
     ) -> BoxFuture<'a, Result<Value, AgentError>>;
 }
 
-/// The one place a declaration's wire options become the compat layer's, so
-/// the two defaults are written once.
+/// Where a declaration's wire options become the compat layer's, so
+/// `max_tokens_field` and `include_stream_usage` pick up their defaults in one
+/// place.
 fn compat_config(options: &CodecOptions) -> OpenAiCompatConfig {
     OpenAiCompatConfig {
         slug: options.slug.clone(),
@@ -112,9 +109,9 @@ fn compat_config(options: &CodecOptions) -> OpenAiCompatConfig {
     }
 }
 
-/// The one place the protocol -> codec dispatch is spelled out. Every codec
-/// here honours `system_prefix` except google, which drops it (see
-/// [`super::google`]) and refuses it at registration instead.
+/// The one place a protocol picks its codec. Every codec here honours
+/// `system_prefix` except google, which drops it (see [`super::google`]) and
+/// refuses one at registration instead.
 pub fn build(
     options: CodecOptions,
     auth: Arc<Mutex<ResolvedAuth>>,
@@ -164,8 +161,8 @@ impl Provider for CompatProvider {
 
             if self.protocol == Protocol::OpenaiResponses {
                 // `responses::do_stream` reads the origin off the auth alone,
-                // so the three-way precedence is resolved here instead. Left
-                // untouched when nothing resolved, so a declaration with no
+                // so the three-way precedence has to be settled here. Nothing
+                // resolved means nothing written, so a declaration with no
                 // origin anywhere still fails there rather than posting to "".
                 let resolved = self.compat.base_url(&auth);
                 if !resolved.is_empty() {
@@ -188,13 +185,15 @@ impl Provider for CompatProvider {
             }
 
             let mut body = self.compat.build_body(model, messages, system, tools);
-            // A substitution, never both: a declared dialect is the provider
-            // saying how its own API spells effort, which is a different
-            // question from what the model declared about itself, and
-            // `apply_reasoning_effort` deliberately skips both the
-            // `thinking_fields` merge and the `supports_thinking` gate.
+            // One or the other, never both: a declared dialect is the provider
+            // saying how its own API spells effort, a different question from
+            // what the model said about itself, so `apply_reasoning_effort`
+            // skips the `thinking_fields` merge and the `supports_thinking`
+            // gate on purpose.
             match self.thinking_dialect {
-                Some(dialect) => opts.thinking.apply_reasoning_effort(&mut body, dialect, model),
+                Some(dialect) => opts
+                    .thinking
+                    .apply_reasoning_effort(&mut body, dialect, model),
                 None => opts
                     .thinking
                     .apply_thinking(&mut body, model, ThinkingFallback::None),
@@ -249,11 +248,14 @@ mod tests {
     #[test]
     fn a_declared_origin_is_the_last_resort() {
         let compat = compat(DECLARED_SLUG);
-        assert_eq!(compat.base_url(&no_credentials(DECLARED_SLUG)), DECLARED_URL);
+        assert_eq!(
+            compat.base_url(&no_credentials(DECLARED_SLUG)),
+            DECLARED_URL
+        );
     }
 
-    /// What the empty `slug` on the old shared config hid: a plugin or
-    /// `providers.toml` provider never consulted `<SLUG>_BASE_URL` at all, so
+    /// The bug the empty `slug` on the old shared config hid: a plugin or
+    /// `providers.toml` provider never looked at `<SLUG>_BASE_URL` at all, so
     /// a declaration outranked the user.
     #[test]
     fn a_user_origin_beats_a_declared_one() {
@@ -262,14 +264,13 @@ mod tests {
         assert_eq!(compat.base_url(&no_credentials(OVERRIDDEN_SLUG)), USER_URL);
     }
 
-    /// Provenance is carried by the type. A hook's origin comes through
+    /// The two origins live in different fields, so one cannot overwrite the
+    /// other: a hook's lands in the auth cell through
     /// [`PluginAuth::into_resolved`], the one door that vets it against the
-    /// declared hosts, and lands in the auth cell; `resolved_base_url` is read
-    /// off the user's env and `providers.toml` at construction and no hook can
-    /// reach it. So a hook wins the request it answered for without becoming
-    /// what the user configured.
+    /// declared hosts, while the user's sits in `resolved_base_url` where no
+    /// hook can reach it.
     #[test]
-    fn a_hook_origin_wins_without_replacing_the_user_s() {
+    fn a_hook_origin_wins_only_for_the_request_it_answered() {
         unsafe { std::env::set_var(HOOKED_ENV, USER_URL) };
         let compat = compat(HOOKED_SLUG);
         let hooked = PluginAuth {

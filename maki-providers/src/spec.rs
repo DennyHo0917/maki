@@ -234,11 +234,12 @@ impl ProviderRegistry {
 /// knows about a slug: a catalog-backed builtin has a spec row and is still
 /// `Catalog` here.
 pub enum Owner {
+    /// A registered declaration, whoever authored it -- a Lua plugin or maki's
+    /// own Rust list.
+    Plugin,
     /// Carries the constructor rather than the spec, so "builtin" and
     /// "buildable" cannot come apart.
     Builtin(NewFn),
-    /// `maki.provider.register` from a Lua plugin
-    Plugin,
     /// `providers.toml`
     Custom,
     /// models.dev
@@ -248,11 +249,18 @@ pub enum Owner {
 
 impl Owner {
     pub fn of(slug: &str) -> Self {
-        if let Some(native) = ProviderRegistry::get(slug).and_then(|s| s.native) {
-            return Self::Builtin(native.new);
-        }
+        // A registered declaration answers first, built-in row or not: the decl
+        // is what constructs the slug now, and a built-in that has been ported
+        // is exactly a slug with both a row and a decl.
+        //
+        // While a provider still has a bespoke `native` impl and no decl
+        // nothing changes for it -- the honest shape of a half-done migration,
+        // and what makes the ports land one at a time.
         if plugin::is_registered(slug) {
             return Self::Plugin;
+        }
+        if let Some(native) = ProviderRegistry::get(slug).and_then(|s| s.native) {
+            return Self::Builtin(native.new);
         }
         if custom::base_spec(slug).is_some() {
             return Self::Custom;

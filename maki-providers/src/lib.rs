@@ -8,6 +8,10 @@ pub mod provider;
 pub(crate) mod providers;
 pub mod retry;
 pub mod spec;
+/// One recorded server for two audiences: other crates get it behind the
+/// feature, this crate's own tests get it without.
+#[cfg(any(test, feature = "test-support"))]
+pub mod test_support;
 pub mod tokens;
 pub(crate) mod types;
 

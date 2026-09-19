@@ -499,7 +499,8 @@ impl Provider for OpenAi {
             let mut buf = String::new();
             let system = super::super::with_prefix(&self.system_prefix, system, &mut buf);
 
-            let discovered = model_registry::provider_info::<PlanModelInfo>(&CONFIG.slug, &model.id);
+            let discovered =
+                model_registry::provider_info::<PlanModelInfo>(&CONFIG.slug, &model.id);
             let plan_dialect = discovered
                 .as_deref()
                 .map(PlanModelInfo::dialect)

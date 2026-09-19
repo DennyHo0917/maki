@@ -250,8 +250,10 @@ impl Provider for OpenRouter {
 
             body["cache_control"] = json!({"type": "ephemeral"});
 
-            let reasoning_info =
-                crate::model_registry::provider_info::<OpenRouterModelInfo>(&CONFIG.slug, &model.id);
+            let reasoning_info = crate::model_registry::provider_info::<OpenRouterModelInfo>(
+                &CONFIG.slug,
+                &model.id,
+            );
 
             let effort_dialect = effort_dialect(reasoning_info.as_deref());
             if model.supports_thinking()

@@ -3680,17 +3680,31 @@ ignored at request time: `build_body` needs one of the `openai` codecs, and
 {spec} fields:
   `slug` (string) Required. How the provider is addressed: `<slug>/<model>`.
           Letters, digits, `_` and `-`, starting with a letter or digit, and
-          not a slug a built-in or `providers.toml` already owns.
-  `display_name` (string) Required. Shown in the UI.
+          not a slug `providers.toml` already owns. A built-in slug may be
+          claimed: the decl then inherits `display_name`, `api_key_env`,
+          the curated model table and pricing from the built-in, so
+          restating any of those is an error rather than an override.
+  `display_name` (string) Required, except for a decl claiming a built-in
+          slug. Shown in the UI.
   `codec` (string) `"openai"`, `"openai-responses"`, `"anthropic"` or
           `"google"`. Mutually exclusive with `base`.
   `base` (string) A native provider slug to build on, e.g. `"anthropic"`.
-  `base_url` (string) Default origin for requests. Its host must be one of
-          the declared `net_hosts`, and it must be `https` unless it points
-          at loopback.
+  `base_url` (string) Last-resort origin for requests: `<SLUG>_BASE_URL`
+          and `providers.toml` both outrank it, and an origin an auth hook
+          returns outranks those. Its host must be one of the declared
+          `net_hosts`, and it must be `https` unless it points at loopback.
   `api_key_env` (string) Environment variable holding an API key. Read at
           registration and sent as a bearer token when set.
   `system_prefix` (string) Text prepended to the system prompt.
+  `max_tokens_field` (string) Body field carrying the output cap. Defaults
+          to `max_tokens`.
+  `include_stream_usage` (boolean) Whether to ask for usage on the stream.
+          Defaults to `true`.
+  `thinking_dialect` (string) Names the provider's effort dialect, one of
+          `"standard"`, `"codex"`, `"codex-5-1"`, `"coding-plan"`,
+          `"gpt-5-6"`, `"gpt-6"`, `"prefer-high"`, `"high-only"`, `"glm"`,
+          `"deepseek"`, `"anthropic-adaptive"`, `"tensorx"`, `"grok"` or
+          `"ollama"`. Omitting it sends no effort field.
   `models` (table) List of model rows. Each row has `prefixes` (list): the
            row answers for every model id starting with one of them,
            longest prefix first, and `prefixes[1]` is the canonical id.

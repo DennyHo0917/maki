@@ -143,6 +143,20 @@ impl FromStr for Protocol {
     }
 }
 
+/// Who wrote the declaration that serves a slug. A few slugs are declared
+/// twice, once in Lua and once in Rust, and both declarations drive the same
+/// code path, so this picks an author and not a behaviour.
+///
+/// Leaving it out picks Lua, the surface plugin authors work with every day.
+/// `impl = "rust"` pins the copy compiled into the binary, for anyone the Lua
+/// one misbehaves for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ImplChoice {
+    Rust,
+    Lua,
+}
+
 #[derive(Debug, Clone, Copy, Serialize)]
 pub struct ProviderPlan {
     pub display_name: &'static str,
@@ -250,6 +264,11 @@ pub struct ProviderDef {
     pub overrides: HashMap<String, ProviderOverride>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub models: Vec<ModelDef>,
+    /// Which declaration serves this slug, see [`ImplChoice`]. Optional rather
+    /// than a defaulted enum so rewriting the file does not pin every provider
+    /// to an author the user never picked.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub r#impl: Option<ImplChoice>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -594,6 +613,29 @@ mod tests {
     fn provider_def_enable_free_models_defaults_none() {
         let def: ProviderDef = toml::from_str(EMPTY_PROVIDER_DEF_TOML).unwrap();
         assert_eq!(def.enable_free_models, None);
+    }
+
+    const UNKNOWN_VARIANT_ERROR: &str = "unknown variant";
+    const UNKNOWN_IMPL_TOML: &str = r#"impl = "rusty""#;
+
+    #[test_case(r#"impl = "rust""#, Some(ImplChoice::Rust) ; "rust")]
+    #[test_case(r#"impl = "lua""#, Some(ImplChoice::Lua) ; "lua")]
+    #[test_case(EMPTY_PROVIDER_DEF_TOML, None ; "absent")]
+    fn provider_def_impl_parses(source: &str, expected: Option<ImplChoice>) {
+        let def: ProviderDef = toml::from_str(source).unwrap();
+        assert_eq!(def.r#impl, expected);
+    }
+
+    /// Falling back to the default on a typo would quietly hand the slug to the
+    /// other declaration, so the parse has to fail loudly instead.
+    #[test]
+    fn provider_def_rejects_unknown_impl() {
+        let err = toml::from_str::<ProviderDef>(UNKNOWN_IMPL_TOML).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains(UNKNOWN_VARIANT_ERROR),
+            "expected enum hint, got: {msg}"
+        );
     }
 
     const UNKNOWN_TIER_TOML: &str = r#"id = "x"

@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::sync::{Arc, Mutex};
 
 use flume::Sender;
@@ -37,12 +38,12 @@ const MAX_TOKENS_FIELD: &str = "max_tokens";
 const FEATURES: &str = "Thinking mode toggle (on/off), open-weight models";
 
 static CONFIG: OpenAiCompatConfig = OpenAiCompatConfig {
-    slug: SLUG,
-    api_key_env: ENV_VAR,
-    base_url: BASE_URL,
-    max_tokens_field: MAX_TOKENS_FIELD,
+    slug: Cow::Borrowed(SLUG),
+    api_key_env: Cow::Borrowed(ENV_VAR),
+    base_url: Cow::Borrowed(BASE_URL),
+    max_tokens_field: Cow::Borrowed(MAX_TOKENS_FIELD),
     include_stream_usage: true,
-    provider_name: DISPLAY_NAME,
+    provider_name: Cow::Borrowed(DISPLAY_NAME),
 };
 
 pub(crate) const SPEC: ProviderSpec = ProviderSpec {
@@ -161,11 +162,11 @@ pub struct DeepSeek {
 
 impl DeepSeek {
     pub fn new(timeouts: super::Timeouts) -> Result<Self, AgentError> {
-        let pool = KeyPool::resolve(CONFIG.slug, CONFIG.api_key_env)?;
+        let pool = KeyPool::resolve(&CONFIG.slug, &CONFIG.api_key_env)?;
         Ok(Self {
             compat: OpenAiCompatProvider::new(&CONFIG, timeouts),
             auth: Arc::new(Mutex::new(ResolvedAuth::bearer(
-                CONFIG.slug,
+                &CONFIG.slug,
                 pool.current(),
             )?)),
             key_pool: Some(pool),
@@ -304,7 +305,7 @@ mod tests {
     /// DeepSeek turn at the wrong rate.
     #[test]
     fn the_manifest_bills_the_published_peak_hours() {
-        let schedule = ProviderRegistry::get(CONFIG.slug)
+        let schedule = ProviderRegistry::get(&CONFIG.slug)
             .expect("deepseek is a builtin")
             .pricing_schedule
             .expect("deepseek bills by the clock");

@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::sync::{Arc, Mutex};
 
 use flume::Sender;
@@ -252,7 +253,7 @@ impl LocalEndpoint {
         let base = auth
             .base_url
             .as_deref()
-            .unwrap_or(self.compat.config().base_url);
+            .unwrap_or(&self.compat.config().base_url);
         let root = base.strip_suffix("/v1").unwrap_or(base);
 
         let props: serde_json::Value = serde_json::from_str(
@@ -408,7 +409,7 @@ impl LocalEndpoint {
         let base = auth
             .base_url
             .as_deref()
-            .unwrap_or(self.compat.config().base_url);
+            .unwrap_or(&self.compat.config().base_url);
         let root = base.strip_suffix("/v1").unwrap_or(base);
 
         let models_text = self
@@ -526,6 +527,8 @@ fn ollama_extract_num_ctx(params: &str) -> Option<u32> {
 
 const OLLAMA_SLUG: &str = "ollama";
 const LLAMACPP_SLUG: &str = "llama-cpp";
+pub(crate) const OLLAMA_BASE_URL: &str = "http://localhost:11434/v1";
+pub(crate) const LLAMACPP_BASE_URL: &str = "http://localhost:8080/v1";
 
 pub(crate) const OLLAMA: LocalEndpointConfig = LocalEndpointConfig {
     slug: OLLAMA_SLUG,
@@ -537,12 +540,12 @@ pub(crate) const OLLAMA: LocalEndpointConfig = LocalEndpointConfig {
     cloud_fallback_url: Some("https://ollama.com/v1"),
     discovery_mode: DiscoveryMode::Ollama,
     compat: OpenAiCompatConfig {
-        slug: OLLAMA_SLUG,
-        api_key_env: "",
-        base_url: "http://localhost:11434/v1",
-        max_tokens_field: "max_tokens",
+        slug: Cow::Borrowed(OLLAMA_SLUG),
+        api_key_env: Cow::Borrowed(""),
+        base_url: Cow::Borrowed(OLLAMA_BASE_URL),
+        max_tokens_field: Cow::Borrowed("max_tokens"),
         include_stream_usage: true,
-        provider_name: "Ollama",
+        provider_name: Cow::Borrowed("Ollama"),
     },
     // Ollama ignores the budget field, so effort is the only thing it hears.
     thinking_fallback: ThinkingFallback::Dialect(&crate::dialect::OLLAMA),
@@ -558,12 +561,12 @@ pub(crate) const LLAMACPP: LocalEndpointConfig = LocalEndpointConfig {
     cloud_fallback_url: None,
     discovery_mode: DiscoveryMode::LlamaCpp,
     compat: OpenAiCompatConfig {
-        slug: LLAMACPP_SLUG,
-        api_key_env: "",
-        base_url: "http://localhost:8080/v1",
-        max_tokens_field: "max_tokens",
+        slug: Cow::Borrowed(LLAMACPP_SLUG),
+        api_key_env: Cow::Borrowed(""),
+        base_url: Cow::Borrowed(LLAMACPP_BASE_URL),
+        max_tokens_field: Cow::Borrowed("max_tokens"),
         include_stream_usage: true,
-        provider_name: "LlamaCpp",
+        provider_name: Cow::Borrowed("LlamaCpp"),
     },
     thinking_fallback: ThinkingFallback::BudgetField,
 };

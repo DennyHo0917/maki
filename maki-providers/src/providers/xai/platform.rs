@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::sync::{Arc, Mutex};
 
 use flume::Sender;
@@ -18,12 +19,12 @@ use crate::{
 use super::{auth, catalog};
 
 static CONFIG: OpenAiCompatConfig = OpenAiCompatConfig {
-    slug: super::SLUG,
-    api_key_env: auth::API_KEY_ENV,
-    base_url: "https://api.x.ai/v1",
-    max_tokens_field: "max_tokens",
+    slug: Cow::Borrowed(super::SLUG),
+    api_key_env: Cow::Borrowed(auth::API_KEY_ENV),
+    base_url: Cow::Borrowed("https://api.x.ai/v1"),
+    max_tokens_field: Cow::Borrowed("max_tokens"),
     include_stream_usage: true,
-    provider_name: "xAI",
+    provider_name: Cow::Borrowed("xAI"),
 };
 
 const ENCRYPTED_REASONING: &str = "reasoning.encrypted_content";

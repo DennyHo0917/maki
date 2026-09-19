@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::sync::{Arc, Mutex};
 
 use flume::Sender;
@@ -33,12 +34,12 @@ const MAX_TOKENS_FIELD: &str = "max_tokens";
 const AUTH_NOTE: &str = "(shared across both endpoints)";
 
 static CONFIG_STANDARD: OpenAiCompatConfig = OpenAiCompatConfig {
-    slug: SLUG,
-    api_key_env: ENV_VAR,
-    base_url: BASE_URL,
-    max_tokens_field: MAX_TOKENS_FIELD,
+    slug: Cow::Borrowed(SLUG),
+    api_key_env: Cow::Borrowed(ENV_VAR),
+    base_url: Cow::Borrowed(BASE_URL),
+    max_tokens_field: Cow::Borrowed(MAX_TOKENS_FIELD),
     include_stream_usage: false,
-    provider_name: DISPLAY_NAME,
+    provider_name: Cow::Borrowed(DISPLAY_NAME),
 };
 
 const PLANS: &[(&str, ProviderPlan)] = &[
@@ -181,7 +182,7 @@ pub struct Zai {
 
 impl Zai {
     pub fn new(timeouts: super::Timeouts) -> Result<Self, AgentError> {
-        let pool = KeyPool::resolve("zai", CONFIG_STANDARD.api_key_env)?;
+        let pool = KeyPool::resolve("zai", &CONFIG_STANDARD.api_key_env)?;
         let mut auth = ResolvedAuth::bearer("zai", pool.current())?;
         let provider_config = maki_config::providers::ProvidersConfig::load();
         if let Some(url) =

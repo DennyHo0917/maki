@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::sync::{Arc, Mutex};
 
 use flume::Sender;
@@ -27,12 +28,12 @@ const LOGIN_URL: &str = "https://admin.mistral.ai/organization/api-keys";
 const MAX_TOKENS_FIELD: &str = "max_tokens";
 
 static CONFIG: OpenAiCompatConfig = OpenAiCompatConfig {
-    slug: SLUG,
-    api_key_env: ENV_VAR,
-    base_url: BASE_URL,
-    max_tokens_field: MAX_TOKENS_FIELD,
+    slug: Cow::Borrowed(SLUG),
+    api_key_env: Cow::Borrowed(ENV_VAR),
+    base_url: Cow::Borrowed(BASE_URL),
+    max_tokens_field: Cow::Borrowed(MAX_TOKENS_FIELD),
     include_stream_usage: true,
-    provider_name: DISPLAY_NAME,
+    provider_name: Cow::Borrowed(DISPLAY_NAME),
 };
 
 const PLANS: &[(&str, ProviderPlan)] = &[
@@ -156,7 +157,7 @@ fn convert_assistant_messages_in_place(messages: &mut Value) {
 
 impl Mistral {
     pub fn new(timeouts: super::Timeouts) -> Result<Self, AgentError> {
-        let pool = KeyPool::resolve("mistral", CONFIG.api_key_env)?;
+        let pool = KeyPool::resolve("mistral", &CONFIG.api_key_env)?;
         Ok(Self {
             compat: OpenAiCompatProvider::new(&CONFIG, timeouts),
             auth: Arc::new(Mutex::new(ResolvedAuth::bearer("mistral", pool.current())?)),

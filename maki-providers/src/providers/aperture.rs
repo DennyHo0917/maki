@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
@@ -39,12 +40,12 @@ const DISCOVERY_NOTE: &str = "Aperture discovers models from your gateway. Set `
      endpoint (e.g. `https://your-host.tailnet.ts.net`). No API key needed, Tailscale handles auth.";
 
 static CONFIG: OpenAiCompatConfig = OpenAiCompatConfig {
-    slug: SLUG,
-    api_key_env: NO_ENV_VAR,
-    base_url: "",
-    max_tokens_field: MAX_TOKENS_FIELD,
+    slug: Cow::Borrowed(SLUG),
+    api_key_env: Cow::Borrowed(NO_ENV_VAR),
+    base_url: Cow::Borrowed(""),
+    max_tokens_field: Cow::Borrowed(MAX_TOKENS_FIELD),
     include_stream_usage: true,
-    provider_name: DISPLAY_NAME,
+    provider_name: Cow::Borrowed(DISPLAY_NAME),
 };
 
 /// Aperture routes onto other providers; nothing routes onto Aperture.
@@ -217,7 +218,7 @@ impl Aperture {
     pub fn new(timeouts: Timeouts) -> Result<Self, AgentError> {
         let base_url = resolve_base_url()?;
         let auth = Arc::new(Mutex::new(
-            ResolvedAuth::new(CONFIG.slug, Vec::new())?.with_base_url(Some(base_url)),
+            ResolvedAuth::new(&CONFIG.slug, Vec::new())?.with_base_url(Some(base_url)),
         ));
         Ok(Self::with_auth_and_overrides(
             auth,

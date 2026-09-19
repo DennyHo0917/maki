@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::sync::{Arc, Mutex};
 
 use flume::Sender;
@@ -39,12 +40,12 @@ const DISCOVERY_NOTE: &str = "OpenRouter aggregates models from many providers b
      Use any model ID directly (e.g. `openrouter/anthropic/claude-sonnet-4`).";
 
 static CONFIG: OpenAiCompatConfig = OpenAiCompatConfig {
-    slug: SLUG,
-    api_key_env: ENV_VAR,
-    base_url: BASE_URL,
-    max_tokens_field: MAX_TOKENS_FIELD,
+    slug: Cow::Borrowed(SLUG),
+    api_key_env: Cow::Borrowed(ENV_VAR),
+    base_url: Cow::Borrowed(BASE_URL),
+    max_tokens_field: Cow::Borrowed(MAX_TOKENS_FIELD),
     include_stream_usage: true,
-    provider_name: DISPLAY_NAME,
+    provider_name: Cow::Borrowed(DISPLAY_NAME),
 };
 
 pub(crate) const SPEC: ProviderSpec = ProviderSpec {
@@ -112,11 +113,11 @@ pub struct OpenRouter {
 
 impl OpenRouter {
     pub fn new(timeouts: super::Timeouts) -> Result<Self, AgentError> {
-        let pool = KeyPool::resolve(CONFIG.slug, CONFIG.api_key_env)?;
+        let pool = KeyPool::resolve(&CONFIG.slug, &CONFIG.api_key_env)?;
         Ok(Self {
             compat: OpenAiCompatProvider::new(&CONFIG, timeouts),
             auth: Arc::new(Mutex::new(ResolvedAuth::bearer(
-                CONFIG.slug,
+                &CONFIG.slug,
                 pool.current(),
             )?)),
             key_pool: Some(pool),
@@ -250,7 +251,7 @@ impl Provider for OpenRouter {
             body["cache_control"] = json!({"type": "ephemeral"});
 
             let reasoning_info =
-                crate::model_registry::provider_info::<OpenRouterModelInfo>(CONFIG.slug, &model.id);
+                crate::model_registry::provider_info::<OpenRouterModelInfo>(&CONFIG.slug, &model.id);
 
             let effort_dialect = effort_dialect(reasoning_info.as_deref());
             if model.supports_thinking()

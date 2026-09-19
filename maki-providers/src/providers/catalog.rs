@@ -8,6 +8,7 @@
 //! their own [`CatalogProvider`] instance, created from the same
 //! [`ProviderData`].
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
@@ -429,12 +430,12 @@ pub(crate) fn config_error(message: String) -> AgentError {
 }
 
 static CATALOG_PROVIDER_CONFIG: OpenAiCompatConfig = OpenAiCompatConfig {
-    slug: "",
-    api_key_env: "",
-    base_url: "",
-    max_tokens_field: "max_tokens",
+    slug: Cow::Borrowed(""),
+    api_key_env: Cow::Borrowed(""),
+    base_url: Cow::Borrowed(""),
+    max_tokens_field: Cow::Borrowed("max_tokens"),
     include_stream_usage: true,
-    provider_name: "catalog",
+    provider_name: Cow::Borrowed("catalog"),
 };
 
 static SHARED_CATALOG: OnceLock<Mutex<CatalogData>> = OnceLock::new();

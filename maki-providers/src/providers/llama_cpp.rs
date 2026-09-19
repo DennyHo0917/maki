@@ -49,7 +49,7 @@ pub(crate) const SPEC: ProviderSpec = ProviderSpec {
     docs: GeneratedDocs {
         // Docs quote the codec url, which carries the `/v1` segment the login
         // default leaves off.
-        api_urls: &[LLAMACPP.compat.base_url],
+        api_urls: &[super::local::LLAMACPP_BASE_URL],
         features: Some(FEATURES),
         auth: AuthDoc::EnvVar,
         catalog: CatalogDoc::Discovered(DISCOVERY_NOTE),

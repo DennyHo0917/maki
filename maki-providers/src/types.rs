@@ -603,6 +603,37 @@ fn merge_body(body: &mut Map<String, Value>, fragment: &Map<String, Value>) {
     }
 }
 
+macro_rules! dialects {
+    ($(
+        $(#[doc = $doc:expr])+
+        $konst:ident $name:literal {
+            supported: [$($level:ident),+ $(,)?],
+            adaptive: $adaptive:expr,
+            off: $off:expr $(,)?
+        }
+    ),+ $(,)?) => {
+        $(
+            $(#[doc = $doc])+
+            pub const $konst: EffortDialect = EffortDialect {
+                supported: &[$($level),+],
+                adaptive: $adaptive,
+                off: $off,
+            };
+        )+
+
+        /// Every dialect name, in declaration order.
+        pub const NAMES: &[&str] = &[$($name),+];
+
+        /// Resolve a dialect by its wire name, as listed in [`NAMES`].
+        pub fn by_name(name: &str) -> Option<&'static EffortDialect<'static>> {
+            match name {
+                $($name => Some(&$konst),)+
+                _ => None,
+            }
+        }
+    };
+}
+
 pub mod dialect {
     use super::EffortDialect;
     use maki_storage::sessions::Effort::{High, Low, Max, Medium, Minimal, XHigh};
@@ -611,102 +642,104 @@ pub mod dialect {
     /// opt-out.
     pub const OFF: &str = "none";
 
-    /// OpenAI platform, synthetic.
-    pub const STANDARD: EffortDialect = EffortDialect {
-        supported: &[Minimal, Low, Medium, High],
-        adaptive: Some(Medium),
-        off: None,
-    };
-    /// OpenAI Responses API models whose highest effort is `xhigh`.
-    pub const CODEX: EffortDialect = EffortDialect {
-        supported: &[Low, Medium, High, XHigh],
-        adaptive: Some(Medium),
-        off: None,
-    };
-    /// OpenAI GPT-5.1 Codex Responses API models.
-    pub const CODEX_5_1: EffortDialect = EffortDialect {
-        supported: &[Low, Medium, High],
-        adaptive: Some(Medium),
-        off: None,
-    };
-    /// OpenAI Coding Plan models that aren't Codex. They keep `minimal`, and
-    /// the Responses API opts out of reasoning with an explicit "none".
-    pub const CODING_PLAN: EffortDialect = EffortDialect {
-        supported: &[Minimal, Low, Medium, High, XHigh],
-        adaptive: Some(Medium),
-        off: Some(OFF),
-    };
-    /// OpenAI GPT-5.6 Coding Plan models (Luna, Terra, Sol), which also take
-    /// `max`.
-    pub const GPT_5_6: EffortDialect = EffortDialect {
-        supported: &[Minimal, Low, Medium, High, XHigh, Max],
-        adaptive: Some(Medium),
-        off: Some(OFF),
-    };
-    /// OpenAI GPT-6 (Astra): `low` through `max`, no `minimal` and no
-    /// explicit opt-out, so Off omits the reasoning field.
-    pub const GPT_6: EffortDialect = EffortDialect {
-        supported: &[Low, Medium, High, XHigh, Max],
-        adaptive: Some(Medium),
-        off: None,
-    };
-    /// opencode chat-completions, openrouter (static fallback).
-    pub const PREFER_HIGH: EffortDialect = EffortDialect {
-        supported: &[Low, Medium, High],
-        adaptive: Some(High),
-        off: None,
-    };
-    /// Mistral.
-    pub const HIGH_ONLY: EffortDialect = EffortDialect {
-        supported: &[High],
-        adaptive: Some(High),
-        off: None,
-    };
-    /// Z.AI. GLM reasons by default, so Off sends "none" explicitly.
-    /// Only use behind `Model::supports_thinking`.
-    pub const GLM: EffortDialect = EffortDialect {
-        supported: &[High, XHigh],
-        adaptive: Some(High),
-        off: Some(OFF),
-    };
-    /// DeepSeek accepts only "max"; Adaptive keeps the model's own default
-    /// reasoning depth by sending no effort at all.
-    pub const DEEPSEEK: EffortDialect = EffortDialect {
-        supported: &[Max],
-        adaptive: None,
-        off: None,
-    };
-    /// `output_config.effort` on Anthropic adaptive-thinking models. The API
-    /// has native adaptive mode, so Adaptive sends no effort.
-    pub const ANTHROPIC_ADAPTIVE: EffortDialect = EffortDialect {
-        supported: &[Low, Medium, High],
-        adaptive: None,
-        off: None,
-    };
-    /// TensorX routes models that may reason by default, so Off sends "none"
-    /// explicitly and Adaptive asks for full depth.
-    pub const TENSORX: EffortDialect = EffortDialect {
-        supported: &[Low, Medium, High],
-        adaptive: Some(High),
-        off: Some(OFF),
-    };
-    /// xAI Grok 4.5/4.6. Adaptive defaults to high; Off sends nothing so the
-    /// model keeps its own default. `xhigh` is advertised on Grok 4.6.
-    pub const GROK: EffortDialect = EffortDialect {
-        supported: &[Low, Medium, High, XHigh],
-        adaptive: Some(High),
-        off: None,
-    };
-    /// Ollama's OpenAI-compat endpoint documents low, medium and high, and
-    /// rejects the rest, so anything higher snaps down. A model with its own
-    /// words for it says so through `thinking_fields` instead. Leaving effort
-    /// out lets a capable model start reasoning on its own, so Off has to say
-    /// "none" out loud. Only use behind `Model::supports_thinking`.
-    pub const OLLAMA: EffortDialect = EffortDialect {
-        supported: &[Low, Medium, High],
-        adaptive: Some(Medium),
-        off: Some(OFF),
-    };
+    dialects! {
+        /// OpenAI platform, synthetic.
+        STANDARD "standard" {
+            supported: [Minimal, Low, Medium, High],
+            adaptive: Some(Medium),
+            off: None
+        },
+        /// OpenAI Responses API models whose highest effort is `xhigh`.
+        CODEX "codex" {
+            supported: [Low, Medium, High, XHigh],
+            adaptive: Some(Medium),
+            off: None
+        },
+        /// OpenAI GPT-5.1 Codex Responses API models.
+        CODEX_5_1 "codex-5-1" {
+            supported: [Low, Medium, High],
+            adaptive: Some(Medium),
+            off: None
+        },
+        /// OpenAI Coding Plan models that aren't Codex. They keep `minimal`, and
+        /// the Responses API opts out of reasoning with an explicit "none".
+        CODING_PLAN "coding-plan" {
+            supported: [Minimal, Low, Medium, High, XHigh],
+            adaptive: Some(Medium),
+            off: Some(OFF)
+        },
+        /// OpenAI GPT-5.6 Coding Plan models (Luna, Terra, Sol), which also take
+        /// `max`.
+        GPT_5_6 "gpt-5-6" {
+            supported: [Minimal, Low, Medium, High, XHigh, Max],
+            adaptive: Some(Medium),
+            off: Some(OFF)
+        },
+        /// OpenAI GPT-6 (Astra): `low` through `max`, no `minimal` and no
+        /// explicit opt-out, so Off omits the reasoning field.
+        GPT_6 "gpt-6" {
+            supported: [Low, Medium, High, XHigh, Max],
+            adaptive: Some(Medium),
+            off: None
+        },
+        /// opencode chat-completions, openrouter (static fallback).
+        PREFER_HIGH "prefer-high" {
+            supported: [Low, Medium, High],
+            adaptive: Some(High),
+            off: None
+        },
+        /// Mistral.
+        HIGH_ONLY "high-only" {
+            supported: [High],
+            adaptive: Some(High),
+            off: None
+        },
+        /// Z.AI. GLM reasons by default, so Off sends "none" explicitly.
+        /// Only use behind `Model::supports_thinking`.
+        GLM "glm" {
+            supported: [High, XHigh],
+            adaptive: Some(High),
+            off: Some(OFF)
+        },
+        /// DeepSeek accepts only "max"; Adaptive keeps the model's own default
+        /// reasoning depth by sending no effort at all.
+        DEEPSEEK "deepseek" {
+            supported: [Max],
+            adaptive: None,
+            off: None
+        },
+        /// `output_config.effort` on Anthropic adaptive-thinking models. The API
+        /// has native adaptive mode, so Adaptive sends no effort.
+        ANTHROPIC_ADAPTIVE "anthropic-adaptive" {
+            supported: [Low, Medium, High],
+            adaptive: None,
+            off: None
+        },
+        /// TensorX routes models that may reason by default, so Off sends "none"
+        /// explicitly and Adaptive asks for full depth.
+        TENSORX "tensorx" {
+            supported: [Low, Medium, High],
+            adaptive: Some(High),
+            off: Some(OFF)
+        },
+        /// xAI Grok 4.5/4.6. Adaptive defaults to high; Off sends nothing so the
+        /// model keeps its own default. `xhigh` is advertised on Grok 4.6.
+        GROK "grok" {
+            supported: [Low, Medium, High, XHigh],
+            adaptive: Some(High),
+            off: None
+        },
+        /// Ollama's OpenAI-compat endpoint documents low, medium and high, and
+        /// rejects the rest, so anything higher snaps down. A model with its own
+        /// words for it says so through `thinking_fields` instead. Leaving effort
+        /// out lets a capable model start reasoning on its own, so Off has to say
+        /// "none" out loud. Only use behind `Model::supports_thinking`.
+        OLLAMA "ollama" {
+            supported: [Low, Medium, High],
+            adaptive: Some(Medium),
+            off: Some(OFF)
+        },
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -1087,6 +1120,8 @@ mod tests {
     /// Ollama is the one path that pairs a dialect with per-model fields.
     const DIALECT: ThinkingFallback = ThinkingFallback::Dialect(&dialect::OLLAMA);
 
+    const UNKNOWN_DIALECT: &str = "name in NAMES must resolve";
+
     const INTERNED_DATA: &str = "aW50ZXJuZWQtcGF5bG9hZA==";
     /// Valid ASCII, but no image ever started with these bytes.
     const UNREADABLE_PAYLOAD: &str = "abc123";
@@ -1401,22 +1436,8 @@ mod tests {
 
     #[test]
     fn dialects_have_non_empty_ascending_supported() {
-        let all = [
-            &dialect::STANDARD,
-            &dialect::CODEX,
-            &dialect::CODEX_5_1,
-            &dialect::CODING_PLAN,
-            &dialect::GPT_5_6,
-            &dialect::PREFER_HIGH,
-            &dialect::HIGH_ONLY,
-            &dialect::GLM,
-            &dialect::DEEPSEEK,
-            &dialect::ANTHROPIC_ADAPTIVE,
-            &dialect::TENSORX,
-            &dialect::GROK,
-            &dialect::OLLAMA,
-        ];
-        for d in all {
+        for name in dialect::NAMES {
+            let d = dialect::by_name(name).expect(UNKNOWN_DIALECT);
             assert!(!d.supported.is_empty());
             for pair in d.supported.windows(2) {
                 assert!(pair[0] < pair[1], "supported must be strictly ascending");
@@ -1425,6 +1446,11 @@ mod tests {
                 assert!(d.supported.contains(&adaptive));
             }
         }
+    }
+
+    #[test]
+    fn unknown_dialect_name_does_not_resolve() {
+        assert!(dialect::by_name("definitely-not-a-dialect").is_none());
     }
 
     #[test_case(ThinkingConfig::Off, "claude-opus-4-5", json!({}) ; "off")]

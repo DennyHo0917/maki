@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::sync::{Arc, Mutex};
 
 use flume::Sender;
@@ -21,12 +22,12 @@ use crate::{AgentError, Message, ProviderEvent, RequestOptions, StreamResponse};
 /// resolves its own origin and key, so the fallbacks here stay empty, and
 /// `provider_name` is a log label rather than a slug.
 static COMPAT_CONFIG: OpenAiCompatConfig = OpenAiCompatConfig {
-    slug: "",
-    api_key_env: "",
-    base_url: "",
-    max_tokens_field: "max_tokens",
+    slug: Cow::Borrowed(""),
+    api_key_env: Cow::Borrowed(""),
+    base_url: Cow::Borrowed(""),
+    max_tokens_field: Cow::Borrowed("max_tokens"),
     include_stream_usage: true,
-    provider_name: "codec",
+    provider_name: Cow::Borrowed("codec"),
 };
 
 /// The native provider a custom or plugin slug borrows its codec and fallbacks

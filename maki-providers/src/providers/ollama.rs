@@ -56,7 +56,7 @@ pub(crate) const SPEC: ProviderSpec = ProviderSpec {
     docs: GeneratedDocs {
         // Docs quote the codec url, which carries the `/v1` segment the login
         // default leaves off.
-        api_urls: &[OLLAMA.compat.base_url],
+        api_urls: &[super::local::OLLAMA_BASE_URL],
         features: Some(FEATURES),
         auth: AuthDoc::Custom(AUTH_DOC),
         catalog: CatalogDoc::Discovered(DISCOVERY_NOTE),

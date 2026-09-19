@@ -129,7 +129,69 @@ pub enum AgentError {
     EmptySummary,
 }
 
+/// Everything the observable predicates ([`AgentError::retry_kind`],
+/// [`AgentError::retry_after`], [`AgentError::is_context_overflow`],
+/// [`AgentError::is_quota_exhausted`], [`AgentError::is_auth_error`])
+/// discriminate on, and nothing else. Two errors with equal projections are
+/// the same error to the retry loop and the compaction path even when their
+/// payloads differ, which is the comparison a replay suite needs from a type
+/// that cannot be `PartialEq` itself.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ErrorProjection {
+    Api {
+        status: u16,
+        retry_after: Option<Duration>,
+        /// The message is read only through these three answers, so two bodies
+        /// that classify alike are the same error here.
+        overflow: Option<Overflow>,
+        quota_exhausted: bool,
+        auth_error: bool,
+    },
+    Config,
+    Tool,
+    /// `retry_kind` reads the kind and nothing else about the error.
+    Io(io::ErrorKind),
+    /// `retry_kind` splits transports on whether a connection was ever made.
+    Http {
+        connect_failure: bool,
+    },
+    HttpRequest,
+    Json,
+    Channel,
+    Cancelled,
+    Timeout,
+    EmptySummary,
+}
+
 impl AgentError {
+    pub fn projection(&self) -> ErrorProjection {
+        match self {
+            Self::Api {
+                status,
+                retry_after,
+                ..
+            } => ErrorProjection::Api {
+                status: *status,
+                retry_after: *retry_after,
+                overflow: self.overflow(),
+                quota_exhausted: self.is_quota_exhausted(),
+                auth_error: self.is_auth_error(),
+            },
+            Self::Config { .. } => ErrorProjection::Config,
+            Self::Tool { .. } => ErrorProjection::Tool,
+            Self::Io(e) => ErrorProjection::Io(e.kind()),
+            Self::Http(e) => ErrorProjection::Http {
+                connect_failure: is_connect_failure(e),
+            },
+            Self::HttpRequest(_) => ErrorProjection::HttpRequest,
+            Self::Json(_) => ErrorProjection::Json,
+            Self::Channel => ErrorProjection::Channel,
+            Self::Cancelled => ErrorProjection::Cancelled,
+            Self::Timeout { .. } => ErrorProjection::Timeout,
+            Self::EmptySummary => ErrorProjection::EmptySummary,
+        }
+    }
+
     /// An API error with no `Retry-After` behind it. Everything that is not a
     /// response we read the headers of lands here, SSE error frames included.
     pub fn api(status: u16, message: impl Into<String>) -> Self {
@@ -684,5 +746,183 @@ mod tests {
     #[test_case("prompt is too long: 250000 tokens > 200000 maximum", Overflow::Prompt ; "anthropic_prompt_alone")]
     fn overflow_kind_is_read_off_the_message(message: &str, expected: Overflow) {
         assert_eq!(api_msg(400, message).overflow(), Some(expected));
+    }
+
+    const VARIANT_COUNT: usize = 11;
+    const CORPUS_STATUSES: [u16; 10] = [400, 401, 402, 403, 408, 413, 429, 500, 503, 529];
+    const CORPUS_RETRY_AFTER: Option<Duration> = Some(Duration::from_secs(30));
+    const PLAIN_MESSAGE: &str = "bad input";
+    const OVERFLOW_MESSAGE: &str = "Input exceeds context limit";
+    /// A second wording of the same refusal: different body, same answers.
+    const OVERFLOW_ALIAS: &str = "context length exceeded";
+    const TOOL_NAME: &str = "bash";
+    const CONFIG_MESSAGE: &str = "no model configured";
+    const TIMEOUT_SECS: u64 = 30;
+    const INVALID_URI: &str = "http://[";
+    const INVALID_JSON: &str = "{";
+
+    /// Exhaustive by construction: a new variant stops this compiling, so the
+    /// coverage assertion cannot quietly go stale.
+    fn variant_index(error: &AgentError) -> usize {
+        match error {
+            AgentError::Api { .. } => 0,
+            AgentError::Config { .. } => 1,
+            AgentError::Tool { .. } => 2,
+            AgentError::Io(_) => 3,
+            AgentError::Http(_) => 4,
+            AgentError::HttpRequest(_) => 5,
+            AgentError::Json(_) => 6,
+            AgentError::Channel => 7,
+            AgentError::Cancelled => 8,
+            AgentError::Timeout { .. } => 9,
+            AgentError::EmptySummary => 10,
+        }
+    }
+
+    fn corpus() -> Vec<AgentError> {
+        let quota = opencode_body("GoUsageLimitError", QUOTA_MESSAGE);
+        let model = opencode_body("ModelError", MODEL_MESSAGE);
+        let messages = [
+            "",
+            PLAIN_MESSAGE,
+            OVERFLOW_MESSAGE,
+            OVERFLOW_ALIAS,
+            ANTHROPIC_BUDGET,
+            VLLM_BUDGET,
+            VLLM_PROMPT_ONLY,
+            SUMMARY_BODY,
+            quota.as_str(),
+            model.as_str(),
+        ];
+        let mut corpus = Vec::new();
+        for status in CORPUS_STATUSES {
+            for message in messages {
+                for retry_after in [None, CORPUS_RETRY_AFTER] {
+                    corpus.push(AgentError::Api {
+                        status,
+                        message: message.into(),
+                        retry_after,
+                    });
+                }
+            }
+        }
+        corpus.extend(
+            [
+                io::ErrorKind::ConnectionRefused,
+                io::ErrorKind::UnexpectedEof,
+                io::ErrorKind::TimedOut,
+                io::ErrorKind::BrokenPipe,
+            ]
+            .map(|kind| AgentError::Io(kind.into())),
+        );
+        corpus.extend(
+            [
+                HttpErrorKind::ConnectionFailed,
+                HttpErrorKind::NameResolution,
+                HttpErrorKind::Io,
+                HttpErrorKind::TlsEngine,
+            ]
+            .map(|kind| AgentError::Http(kind.into())),
+        );
+        corpus.extend([
+            AgentError::Config {
+                message: CONFIG_MESSAGE.into(),
+            },
+            AgentError::Tool {
+                tool: TOOL_NAME.into(),
+                message: PLAIN_MESSAGE.into(),
+            },
+            AgentError::HttpRequest(
+                isahc::http::Uri::try_from(INVALID_URI)
+                    .expect_err("a malformed uri")
+                    .into(),
+            ),
+            AgentError::Json(
+                serde_json::from_str::<Value>(INVALID_JSON).expect_err("truncated json"),
+            ),
+            AgentError::Channel,
+            AgentError::Cancelled,
+            AgentError::Timeout { secs: TIMEOUT_SECS },
+            AgentError::EmptySummary,
+        ]);
+        corpus
+    }
+
+    #[test]
+    fn the_corpus_covers_every_variant() {
+        let mut seen: Vec<usize> = corpus().iter().map(variant_index).collect();
+        seen.sort_unstable();
+        seen.dedup();
+
+        assert_eq!(seen.len(), VARIANT_COUNT);
+    }
+
+    /// The projection is complete when it keeps apart every pair the observable
+    /// predicates keep apart: sharing a projection has to mean sharing all of
+    /// their answers.
+    #[test]
+    fn equal_projections_agree_on_every_observable() {
+        let corpus = corpus();
+        let mut collisions = 0usize;
+        for (index, left) in corpus.iter().enumerate() {
+            for right in &corpus[index + 1..] {
+                if left.projection() != right.projection() {
+                    continue;
+                }
+                collisions += 1;
+                assert_eq!(
+                    observables(left),
+                    observables(right),
+                    "{left:?} vs {right:?}"
+                );
+            }
+        }
+
+        // All-distinct projections would satisfy the property vacuously, so the
+        // corpus has to contain errors that differ only below the projection.
+        assert!(collisions > 0);
+    }
+
+    /// Payloads the observables read beyond the discriminant, each of which the
+    /// naive `(discriminant, status, retry_after)` projection would erase.
+    #[test_case(
+        AgentError::Io(io::ErrorKind::ConnectionRefused.into()),
+        AgentError::Io(io::ErrorKind::UnexpectedEof.into())
+        ; "io_kind"
+    )]
+    #[test_case(
+        AgentError::Http(HttpErrorKind::ConnectionFailed.into()),
+        AgentError::Http(HttpErrorKind::TlsEngine.into())
+        ; "connect_failure"
+    )]
+    #[test_case(api_msg(400, OVERFLOW_MESSAGE), api_msg(400, PLAIN_MESSAGE) ; "overflow")]
+    #[test_case(
+        api_msg(429, &opencode_body("GoUsageLimitError", QUOTA_MESSAGE)),
+        api_msg(429, PLAIN_MESSAGE)
+        ; "quota"
+    )]
+    #[test_case(
+        api_msg(401, &opencode_body("ModelError", MODEL_MESSAGE)),
+        api_msg(401, PLAIN_MESSAGE)
+        ; "auth"
+    )]
+    fn projection_separates_errors_with_different_observables(
+        left: AgentError,
+        right: AgentError,
+    ) {
+        assert_ne!(observables(&left), observables(&right));
+        assert_ne!(left.projection(), right.projection());
+    }
+
+    type Observables = (Option<RetryKind>, Option<Duration>, bool, bool, bool);
+
+    fn observables(error: &AgentError) -> Observables {
+        (
+            error.retry_kind(),
+            error.retry_after(),
+            error.is_context_overflow(),
+            error.is_quota_exhausted(),
+            error.is_auth_error(),
+        )
     }
 }

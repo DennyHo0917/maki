@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::sync::LazyLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
@@ -36,18 +37,25 @@ static PROCESS_TAG: LazyLock<String> = LazyLock::new(|| {
     id[id.len() - PROCESS_TAG_LEN..].to_owned()
 });
 
+#[derive(Clone)]
 pub(crate) struct OpenAiCompatConfig {
-    pub slug: &'static str,
-    pub api_key_env: &'static str,
-    pub base_url: &'static str,
-    pub max_tokens_field: &'static str,
+    pub slug: Cow<'static, str>,
+    pub api_key_env: Cow<'static, str>,
+    pub base_url: Cow<'static, str>,
+    pub max_tokens_field: Cow<'static, str>,
     pub include_stream_usage: bool,
-    pub provider_name: &'static str,
+    pub provider_name: Cow<'static, str>,
+}
+
+impl From<&'static OpenAiCompatConfig> for Cow<'static, OpenAiCompatConfig> {
+    fn from(config: &'static OpenAiCompatConfig) -> Self {
+        Cow::Borrowed(config)
+    }
 }
 
 pub(crate) struct OpenAiCompatProvider {
     client: HttpClient,
-    config: &'static OpenAiCompatConfig,
+    config: Cow<'static, OpenAiCompatConfig>,
     stream_timeout: Duration,
     /// Env / `providers.toml` override, resolved once at construction. The
     /// static compat default stays the last resort because it can be more
@@ -58,12 +66,16 @@ pub(crate) struct OpenAiCompatProvider {
 }
 
 impl OpenAiCompatProvider {
-    pub fn new(config: &'static OpenAiCompatConfig, timeouts: super::Timeouts) -> Self {
+    pub fn new(
+        config: impl Into<Cow<'static, OpenAiCompatConfig>>,
+        timeouts: super::Timeouts,
+    ) -> Self {
+        let config = config.into();
         let resolved_base_url = if config.slug.is_empty() {
             None
         } else {
             let providers = maki_config::providers::ProvidersConfig::load();
-            maki_config::providers::configured_base_url(config.slug, providers.get(config.slug))
+            maki_config::providers::configured_base_url(&config.slug, providers.get(&config.slug))
         };
         Self {
             client: super::http_client(timeouts),
@@ -77,8 +89,8 @@ impl OpenAiCompatProvider {
         &self.client
     }
 
-    pub(crate) fn config(&self) -> &'static OpenAiCompatConfig {
-        self.config
+    pub(crate) fn config(&self) -> &OpenAiCompatConfig {
+        &self.config
     }
 
     pub(crate) fn stream_timeout(&self) -> Duration {
@@ -145,7 +157,7 @@ impl OpenAiCompatProvider {
             "stream": true,
         });
         if let Some(max_output) = model.output_tokens() {
-            body[self.config.max_tokens_field] = json!(max_output);
+            body[&*self.config.max_tokens_field] = json!(max_output);
         }
         if self.config.include_stream_usage {
             body["stream_options"] = json!({"include_usage": true});
@@ -203,7 +215,7 @@ impl OpenAiCompatProvider {
 
         debug!(
             model = %model.id,
-            provider = self.config.provider_name,
+            provider = &*self.config.provider_name,
             "sending API request"
         );
 

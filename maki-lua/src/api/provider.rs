@@ -8,7 +8,9 @@ use std::time::Duration;
 use maki_config::providers::Protocol;
 use maki_lua_macro::{lua_fn, lua_table};
 use maki_providers::AgentError;
-use maki_providers::plugin::{self, Hook, PluginModel, ProviderHooks, Registration};
+use maki_providers::plugin::{
+    self, DeclSource, Hook, PluginModel, ProviderDecl, ProviderHooks, Registration,
+};
 use maki_providers::provider::BoxFuture;
 use maki_storage::StateDir;
 use maki_storage::auth::{
@@ -550,26 +552,34 @@ fn register(
         release,
     });
 
-    plugin::register(Registration {
-        slug: slug.clone(),
-        display_name: field(&spec, DISPLAY_NAME)?,
-        codec: codec(&spec)?,
-        base: optional(&spec, BASE)?,
-        base_url: optional(&spec, BASE_URL)?,
-        api_key_env: optional(&spec, API_KEY_ENV)?,
-        system_prefix: optional(&spec, SYSTEM_PREFIX)?,
-        models: models(lua, &spec)?,
-        net_hosts: hosts.to_vec(),
-        hooks: ProviderHooks {
-            auth: hook(&keys, HookSlot::Auth, Some(HOOK_TIMEOUT)),
-            list_models: hook(&keys, HookSlot::ListModels, Some(HOOK_TIMEOUT)),
-            build_body: hook(&keys, HookSlot::BuildBody, Some(REQUEST_HOOK_TIMEOUT)),
-            map_error: hook(&keys, HookSlot::MapError, Some(REQUEST_HOOK_TIMEOUT)),
-            fetch_usage: hook(&keys, HookSlot::FetchUsage, Some(HOOK_TIMEOUT)),
-            login: hook(&keys, HookSlot::Login, None),
-            logout: hook(&keys, HookSlot::Logout, None),
+    plugin::register(
+        Registration {
+            decl: ProviderDecl {
+                slug: slug.clone(),
+                display_name: optional(&spec, DISPLAY_NAME)?,
+                codec: codec(&spec)?,
+                base: optional(&spec, BASE)?,
+                base_url: optional(&spec, BASE_URL)?,
+                api_key_env: optional(&spec, API_KEY_ENV)?,
+                system_prefix: optional(&spec, SYSTEM_PREFIX)?,
+                max_tokens_field: None,
+                include_stream_usage: None,
+                thinking_dialect: None,
+                models: models(lua, &spec)?,
+                net_hosts: hosts.to_vec(),
+            },
+            hooks: ProviderHooks {
+                auth: hook(&keys, HookSlot::Auth, Some(HOOK_TIMEOUT)),
+                list_models: hook(&keys, HookSlot::ListModels, Some(HOOK_TIMEOUT)),
+                build_body: hook(&keys, HookSlot::BuildBody, Some(REQUEST_HOOK_TIMEOUT)),
+                map_error: hook(&keys, HookSlot::MapError, Some(REQUEST_HOOK_TIMEOUT)),
+                fetch_usage: hook(&keys, HookSlot::FetchUsage, Some(HOOK_TIMEOUT)),
+                login: hook(&keys, HookSlot::Login, None),
+                logout: hook(&keys, HookSlot::Logout, None),
+            },
         },
-    })
+        DeclSource::Lua,
+    )
     .map_err(|e| mlua::Error::runtime(e.to_string()))?;
 
     slugs.lock().unwrap_or_else(|e| e.into_inner()).push(slug);

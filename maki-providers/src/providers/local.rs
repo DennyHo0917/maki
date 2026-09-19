@@ -16,7 +16,7 @@ use crate::types::ThinkingFallback;
 use crate::{AgentError, Message, ProviderEvent, RequestOptions, StreamResponse};
 
 use super::openai::responses;
-use super::openai_compat::{OpenAiCompatConfig, OpenAiCompatProvider};
+use super::openai_compat::{DEFAULT_MAX_TOKENS_FIELD, OpenAiCompatConfig, OpenAiCompatProvider};
 use super::{KeyHeader, KeyPool, KeyRotation, ResolvedAuth};
 
 pub(crate) struct LocalEndpointConfig {
@@ -543,7 +543,7 @@ pub(crate) const OLLAMA: LocalEndpointConfig = LocalEndpointConfig {
         slug: Cow::Borrowed(OLLAMA_SLUG),
         api_key_env: Cow::Borrowed(""),
         base_url: Cow::Borrowed(OLLAMA_BASE_URL),
-        max_tokens_field: Cow::Borrowed("max_tokens"),
+        max_tokens_field: Cow::Borrowed(DEFAULT_MAX_TOKENS_FIELD),
         include_stream_usage: true,
         provider_name: Cow::Borrowed("Ollama"),
     },
@@ -564,7 +564,7 @@ pub(crate) const LLAMACPP: LocalEndpointConfig = LocalEndpointConfig {
         slug: Cow::Borrowed(LLAMACPP_SLUG),
         api_key_env: Cow::Borrowed(""),
         base_url: Cow::Borrowed(LLAMACPP_BASE_URL),
-        max_tokens_field: Cow::Borrowed("max_tokens"),
+        max_tokens_field: Cow::Borrowed(DEFAULT_MAX_TOKENS_FIELD),
         include_stream_usage: true,
         provider_name: Cow::Borrowed("LlamaCpp"),
     },

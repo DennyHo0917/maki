@@ -49,6 +49,9 @@ pub struct ProviderSpec {
     /// `None` for a slug `catalog::try_create` constructs out of models.dev;
     /// that row carries metadata only.
     pub native: Option<Native>,
+    /// `Some` iff Aperture can proxy onto this provider. Lives on the spec, not
+    /// on [`Native`], so the route survives a provider losing its bespoke impl.
+    pub aperture: Option<ApertureRoute>,
     /// `None` for slugs that are never a `maki auth login` target and so have
     /// no `maki-config` row. `Some` is the *only* authoring site for that row;
     /// see [`ProviderSpec::config_row`].
@@ -73,10 +76,6 @@ pub struct Native {
     /// Build against auth someone else resolved. Used by plugin providers
     /// that extend a base slug and by Aperture's gateway routing.
     pub with_auth: WithAuthFn,
-    /// `Some` iff Aperture can proxy onto this provider. Lives here on
-    /// purpose: a route is only expressible for a provider that has
-    /// `with_auth`.
-    pub aperture: Option<ApertureRoute>,
 }
 
 #[derive(Debug, Clone, Copy)]

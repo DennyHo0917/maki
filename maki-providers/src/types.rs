@@ -603,9 +603,12 @@ fn merge_body(body: &mut Map<String, Value>, fragment: &Map<String, Value>) {
     }
 }
 
+/// One table, and every view of it is read off that table: the consts, the
+/// wire names, and the lookup in both directions. Kept by hand they drift, and
+/// a dialect missing from `by_name` is a declaration that stops loading.
 macro_rules! dialects {
     ($(
-        $(#[doc = $doc:expr])+
+        $(#[$attr:meta])+
         $konst:ident $name:literal {
             supported: [$($level:ident),+ $(,)?],
             adaptive: $adaptive:expr,
@@ -613,7 +616,7 @@ macro_rules! dialects {
         }
     ),+ $(,)?) => {
         $(
-            $(#[doc = $doc])+
+            $(#[$attr])+
             pub const $konst: EffortDialect = EffortDialect {
                 supported: &[$($level),+],
                 adaptive: $adaptive,
@@ -630,6 +633,21 @@ macro_rules! dialects {
                 $($name => Some(&$konst),)+
                 _ => None,
             }
+        }
+
+        /// The name [`by_name`] answers this dialect to, so a declaration can
+        /// serialise the dialect it holds instead of keeping the name twice.
+        /// Written as the inverse of `by_name` so the two cannot drift.
+        ///
+        /// Matched by value, not by address: a `const` is inlined at each use
+        /// site, so two `&STANDARD` need not be the same pointer. `None` for a
+        /// dialect built at runtime out of a model's declared levels (see
+        /// OpenRouter), which no declaration can name.
+        pub fn name_of(dialect: &EffortDialect) -> Option<&'static str> {
+            NAMES
+                .iter()
+                .copied()
+                .find(|name| by_name(name).is_some_and(|known| known == dialect))
         }
     };
 }
@@ -1434,23 +1452,23 @@ mod tests {
         )
     }
 
+    /// `Effort::snap` walks `supported` expecting it sorted, and `name_of`
+    /// matches on field values, so two dialects with identical fields would
+    /// hand a declaration back the wrong name.
     #[test]
-    fn dialects_have_non_empty_ascending_supported() {
+    fn every_dialect_is_well_formed_and_uniquely_named() {
         for name in dialect::NAMES {
             let d = dialect::by_name(name).expect(UNKNOWN_DIALECT);
-            assert!(!d.supported.is_empty());
+            assert!(!d.supported.is_empty(), "{name} supports nothing");
             for pair in d.supported.windows(2) {
-                assert!(pair[0] < pair[1], "supported must be strictly ascending");
+                assert!(pair[0] < pair[1], "{name} is not strictly ascending");
             }
             if let Some(adaptive) = d.adaptive {
-                assert!(d.supported.contains(&adaptive));
+                let supported = d.supported.contains(&adaptive);
+                assert!(supported, "{name} adaptive is not a supported level");
             }
+            assert_eq!(dialect::name_of(d), Some(*name));
         }
-    }
-
-    #[test]
-    fn unknown_dialect_name_does_not_resolve() {
-        assert!(dialect::by_name("definitely-not-a-dialect").is_none());
     }
 
     #[test_case(ThinkingConfig::Off, "claude-opus-4-5", json!({}) ; "off")]

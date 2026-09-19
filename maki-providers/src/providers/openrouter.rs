@@ -62,9 +62,9 @@ pub(crate) const SPEC: ProviderSpec = ProviderSpec {
     native: Some(Native {
         new: create,
         with_auth: create_with_auth,
-        aperture: Some(ApertureRoute {
-            path_prefix: DEFAULT_PATH_PREFIX,
-        }),
+    }),
+    aperture: Some(ApertureRoute {
+        path_prefix: DEFAULT_PATH_PREFIX,
     }),
     login: Some(LoginConfig {
         protocol: Protocol::Openai,

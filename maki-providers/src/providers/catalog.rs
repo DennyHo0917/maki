@@ -29,7 +29,9 @@ use maki_storage::id::SessionRef;
 use crate::model::{Model, ModelInfo, ModelPricing};
 use crate::provider::{BoxFuture, Provider};
 use crate::providers::anthropic::shared;
-use crate::providers::openai_compat::{OpenAiCompatConfig, OpenAiCompatProvider};
+use crate::providers::openai_compat::{
+    DEFAULT_MAX_TOKENS_FIELD, OpenAiCompatConfig, OpenAiCompatProvider,
+};
 use crate::providers::{ResolvedAuth, Timeouts, http_client, opencode, user_agent};
 use crate::{AgentError, Message, ProviderEvent, RequestOptions, StreamResponse, dialect};
 
@@ -433,7 +435,7 @@ static CATALOG_PROVIDER_CONFIG: OpenAiCompatConfig = OpenAiCompatConfig {
     slug: Cow::Borrowed(""),
     api_key_env: Cow::Borrowed(""),
     base_url: Cow::Borrowed(""),
-    max_tokens_field: Cow::Borrowed("max_tokens"),
+    max_tokens_field: Cow::Borrowed(DEFAULT_MAX_TOKENS_FIELD),
     include_stream_usage: true,
     provider_name: Cow::Borrowed("catalog"),
 };

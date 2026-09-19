@@ -57,8 +57,8 @@ pub(crate) const ZEN_SPEC: ProviderSpec = ProviderSpec {
     native: Some(Native {
         new: create,
         with_auth: create_with_auth,
-        aperture: None,
     }),
+    aperture: None,
     login: None,
     docs: GeneratedDocs {
         api_urls: &[ZEN_API_URL],
@@ -81,6 +81,7 @@ pub(crate) const GO_SPEC: ProviderSpec = ProviderSpec {
     models_toml: NO_CURATED_MODELS,
     pricing_schedule: None,
     native: None,
+    aperture: None,
     login: None,
     docs: GeneratedDocs {
         api_urls: &[GO_API_URL],

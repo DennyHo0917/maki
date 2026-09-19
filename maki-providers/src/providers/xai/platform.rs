@@ -10,7 +10,9 @@ use tracing::{debug, warn};
 use crate::model::Model;
 use crate::provider::{BoxFuture, Provider};
 use crate::providers::openai::responses;
-use crate::providers::openai_compat::{OpenAiCompatConfig, OpenAiCompatProvider};
+use crate::providers::openai_compat::{
+    DEFAULT_MAX_TOKENS_FIELD, OpenAiCompatConfig, OpenAiCompatProvider,
+};
 use crate::providers::{ResolvedAuth, refreshed_tokens};
 use crate::{
     AgentError, Message, ProviderEvent, ProviderUsage, RequestOptions, StreamResponse, dialect,
@@ -22,7 +24,7 @@ static CONFIG: OpenAiCompatConfig = OpenAiCompatConfig {
     slug: Cow::Borrowed(super::SLUG),
     api_key_env: Cow::Borrowed(auth::API_KEY_ENV),
     base_url: Cow::Borrowed("https://api.x.ai/v1"),
-    max_tokens_field: Cow::Borrowed("max_tokens"),
+    max_tokens_field: Cow::Borrowed(DEFAULT_MAX_TOKENS_FIELD),
     include_stream_usage: true,
     provider_name: Cow::Borrowed("xAI"),
 };

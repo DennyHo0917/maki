@@ -63,8 +63,8 @@ pub(crate) const SPEC: ProviderSpec = ProviderSpec {
     native: Some(Native {
         new: create,
         with_auth: create_with_auth,
-        aperture: None,
     }),
+    aperture: None,
     login: Some(LoginConfig {
         protocol: Protocol::Openai,
         default_base_url: "",
@@ -162,7 +162,7 @@ fn routed_spec(provider_id: &str, merged: &OverrideFields) -> Option<&'static Pr
 }
 
 fn aperture_route(spec: &ProviderSpec) -> Option<ApertureRoute> {
-    spec.native?.aperture
+    spec.aperture
 }
 
 /// A model that routes nowhere still has to reach the gateway, so it falls back

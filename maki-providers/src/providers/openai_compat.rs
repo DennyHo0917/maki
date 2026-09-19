@@ -28,6 +28,9 @@ const PROCESS_TAG_LEN: usize = 8;
 /// The listing every OpenAI compatible API serves, relative to the base URL.
 /// Providers with a second catalog pass their own path instead.
 pub(crate) const MODELS_PATH: &str = "/models";
+/// What a plain openai endpoint takes, and what a declaration that says
+/// nothing about it gets.
+pub(crate) const DEFAULT_MAX_TOKENS_FIELD: &str = "max_tokens";
 static NEXT_UNNAMED_TOOL_ID: AtomicU64 = AtomicU64::new(0);
 /// Minted once per process: the counter alone restarts at 0 on every run, so a
 /// session resumed with `--continue` would mint ids that already exist in its
@@ -50,6 +53,14 @@ pub(crate) struct OpenAiCompatConfig {
 impl From<&'static OpenAiCompatConfig> for Cow<'static, OpenAiCompatConfig> {
     fn from(config: &'static OpenAiCompatConfig) -> Self {
         Cow::Borrowed(config)
+    }
+}
+
+/// For a config assembled at runtime from a provider declaration, which has no
+/// `static` to borrow. `std` has no blanket `From<T> for Cow<'_, T>`.
+impl From<OpenAiCompatConfig> for Cow<'static, OpenAiCompatConfig> {
+    fn from(config: OpenAiCompatConfig) -> Self {
+        Cow::Owned(config)
     }
 }
 

@@ -45,7 +45,7 @@ pub enum ModelError {
 /// Also the shape of a rate in `models/<slug>.toml`. None of the four rates may
 /// ever gain a `#[serde(default)]`: a curated row that forgets one has to fail
 /// loudly instead of quietly billing the user zero.
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Deserialize, Serialize)]
 pub struct ModelPricing {
     pub input: f64,
     pub output: f64,
@@ -98,7 +98,7 @@ impl ModelInfo {
 /// Cache rates are missing on purpose: Anthropic derives them from `input` with
 /// the same multipliers it uses for standard pricing, so storing them would just
 /// invite the two copies to drift apart.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 pub struct FastPricing {
     pub input: f64,
     pub output: f64,

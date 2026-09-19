@@ -859,10 +859,12 @@ impl Model {
     pub fn from_spec(spec: &str) -> Result<Self, ModelError> {
         let (slug, model_id) = spec.split_once('/').ok_or(ModelError::InvalidFormat)?;
 
-        // Order settles nothing between the first three: registration rejects
-        // any slug a builtin or a custom entry already owns, so they cannot
-        // collide. The models.dev catalogue comes last because it is the open
-        // ended one, and anything defined on this machine should win over it.
+        // Order only decides the last step, because the first three cannot
+        // collide: a declaration claiming a built-in slug inherits that row
+        // instead of restating it, and registration refuses a slug
+        // `providers.toml` already defines. models.dev comes last because it
+        // is the open ended one, and anything defined on this machine should
+        // beat it.
         if let Some(spec) = ProviderRegistry::get(slug) {
             return Ok(Self::from_base(spec, slug, model_id));
         }

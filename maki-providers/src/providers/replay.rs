@@ -18,7 +18,7 @@ use serde_json::{Value, json};
 
 use crate::model::{Model, TokenUsage};
 use crate::provider::Provider;
-use crate::test_support::{Canned, Recorded, serve};
+use crate::test_support::{Canned, Recorded, Requests, serve};
 use crate::tokens::ContextGauge;
 use crate::{AgentError, Message, ProviderEvent, RequestOptions, StreamResponse, ThinkingConfig};
 
@@ -54,7 +54,7 @@ pub(crate) struct Fixture {
 
 /// The question every fixture asks, so two providers driven by this harness
 /// are never answering different ones.
-fn tools() -> Value {
+pub(crate) fn tools() -> Value {
     json!([{
         "name": TOOL_NAME,
         "description": TOOL_DESCRIPTION,
@@ -64,6 +64,10 @@ fn tools() -> Value {
             "required": ["path"],
         },
     }])
+}
+
+fn turn() -> Vec<Message> {
+    vec![Message::user(PROMPT.to_owned())]
 }
 
 /// Runs `fixture` against the provider `build` returns, pointed at a freshly
@@ -78,16 +82,29 @@ pub(crate) fn run(
     model: &Model,
     build: impl FnOnce(&str) -> Box<dyn Provider>,
 ) -> Value {
+    run_with(fixture, model, &turn(), &tools(), build)
+}
+
+/// [`run`] for a provider whose body work reads the history or the tool list.
+/// What it does to an assistant turn is invisible against the lone user
+/// message [`run`] sends, and what it does only when `tools` is present is
+/// invisible when they always are.
+pub(crate) fn run_with(
+    fixture: &Fixture,
+    model: &Model,
+    messages: &[Message],
+    tools: &Value,
+    build: impl FnOnce(&str) -> Box<dyn Provider>,
+) -> Value {
     let (base_url, requests) = serve(fixture.script);
     let provider = build(&base_url);
 
-    let messages = [Message::user(PROMPT.to_owned())];
     let (tx, rx) = flume::unbounded();
     let result = smol::block_on(provider.stream_message(
         model,
-        &messages,
+        messages,
         SYSTEM,
-        &tools(),
+        tools,
         &tx,
         RequestOptions {
             thinking: fixture.thinking,
@@ -99,15 +116,39 @@ pub(crate) fn run(
     let events: Vec<ProviderEvent> = rx.drain().collect();
 
     json!({
-        REQUESTS_KEY: requests
+        REQUESTS_KEY: recorded(&requests),
+        "events": events,
+        "outcome": outcome(&result),
+    })
+}
+
+/// The same recorded exchange for the other endpoint a provider answers on.
+/// Kept apart from [`run`] rather than folded into the `Fixture`: a usage call
+/// sends no messages, emits no events and has no thinking mode, so a shared
+/// entry point would carry three fields it never reads.
+pub(crate) fn run_usage(fixture: &Fixture, build: impl FnOnce(&str) -> Box<dyn Provider>) -> Value {
+    let (base_url, requests) = serve(fixture.script);
+    let provider = build(&base_url);
+    let result = smol::block_on(provider.fetch_usage());
+
+    json!({
+        REQUESTS_KEY: recorded(&requests),
+        "outcome": match &result {
+            Ok(usage) => json!({ "usage": usage }),
+            Err(e) => failure(e),
+        },
+    })
+}
+
+fn recorded(requests: &Requests) -> Value {
+    Value::Array(
+        requests
             .lock()
             .unwrap()
             .iter()
             .map(request_value)
             .collect::<Vec<_>>(),
-        "events": events,
-        "outcome": outcome(&result),
-    })
+    )
 }
 
 /// The request as the observation keeps it: method, path, the header set and
@@ -164,8 +205,12 @@ fn outcome(result: &Result<StreamResponse, AgentError>) -> Value {
         // message only through those predicates, and some behaviour lives
         // nowhere else: a provider that substitutes a message for an error
         // frame that carried none projects identically to one that does not.
-        Err(e) => json!({ "error": format!("{:?}", e.projection()), "message": e.to_string() }),
+        Err(e) => failure(e),
     }
+}
+
+fn failure(e: &AgentError) -> Value {
+    json!({ "error": format!("{:?}", e.projection()), "message": e.to_string() })
 }
 
 /// What a session's gauge learns from this response, which is the whole of
@@ -264,23 +309,32 @@ pub(crate) fn assert_golden(provider: &str, fixture: &Fixture, observed: &Value)
 }
 
 /// The extra assertion the differential half is made of: that the
-/// implementation being ported *away from* puts the same bytes on the wire as
-/// the declaration-driven one.
+/// implementation being ported *away from* observes the same exchange as the
+/// declaration-driven one.
 ///
-/// Deliberately *not* canonicalised, which is the whole difference between
-/// this assertion and [`assert_golden`]. Both observations are produced by one
-/// process under one feature set, so key order is not noise here -- it is part
-/// of what the port has to reproduce, and sorting it away would let a body
-/// that renamed or reordered a field pass as a match.
+/// Canonicalised, like [`assert_golden`]. It was not, once, on the grounds
+/// that both sides run in one process under one feature set and so key order
+/// is free to compare -- but free is not the same as meaningful. `serde_json`
+/// sorts its maps unless something in the build graph turns on
+/// `preserve_order`, so the raw comparison asserted nothing beyond this one
+/// under `-p maki-providers` and asserted field *position* under `--workspace`:
+/// a rule that only exists for some of the builds that run it is not one a port
+/// can be held to. What survives canonicalisation is every field name and every
+/// value at every depth, plus `content-length`, which is the whole of what a
+/// request says. The deepseek port writes `thinking` after the codec has
+/// already written `reasoning_effort`, where the bespoke impl wrote it before:
+/// two positions, one request.
 ///
 /// Deleting this function once the bespoke impl is gone costs no coverage:
 /// every case is still asserted against its golden.
 pub(crate) fn assert_ported(fixture: &Fixture, declared: &Value, ported: &Value) {
+    let declared = canonical_observation(declared);
+    let ported = canonical_observation(ported);
     assert!(
         ported == declared,
         "{} differs between the two implementations\n--- expected\n{}\n--- got\n{}",
         fixture.name,
-        pretty(declared),
-        pretty(ported)
+        pretty(&declared),
+        pretty(&ported)
     );
 }

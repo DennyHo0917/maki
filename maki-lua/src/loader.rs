@@ -163,6 +163,12 @@ static BUNDLED_PLUGINS: &[BundledPlugin] = &[
         name: "list",
         dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/list"),
     },
+    // Registers no tool: it declares the `synthetic` provider on the same
+    // authoring surface a third-party plugin uses, claiming the built-in slug.
+    BundledPlugin {
+        name: "synthetic",
+        dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/synthetic"),
+    },
 ];
 
 /// Every bundled name, not just the default-enabled ones. An external package

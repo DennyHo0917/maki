@@ -540,7 +540,7 @@ A registration sets exactly one of `codec` and `base`. Setting both, or neither,
 | `anthropic` | Anthropic messages |
 | `google` | Gemini `generateContent` |
 
-`base` names a native provider and borrows that provider's whole adapter, quirks included: DeepSeek's reasoning-content padding, Mistral's dialect, Ollama's handling of the thinking field. It exists for people moving an old provider script over, where `base` was the only way to describe a provider. A new provider is better off with a codec, because a base can change behaviour whenever the provider it names does. Valid values: `anthropic`, `openai`, `google`, `copilot`, `ollama`, `llama-cpp`, `mistral`, `zai`, `deepseek`, `openrouter`, `requesty`, `synthetic`, `regolo`, `tensorx`, `opencode`, `xai`, `aperture`.
+`base` names a native provider and borrows that provider's whole adapter, quirks included: DeepSeek's reasoning-content padding, Mistral's dialect, Ollama's handling of the thinking field. It exists for people moving an old provider script over, where `base` was the only way to describe a provider. A new provider is better off with a codec, because a base can change behaviour whenever the provider it names does. Valid values: `anthropic`, `openai`, `google`, `copilot`, `ollama`, `llama-cpp`, `mistral`, `zai`, `deepseek`, `openrouter`, `requesty`, `regolo`, `tensorx`, `opencode`, `xai`, `aperture`.
 
 Either choice also supplies defaults. A registration with no `models` table borrows the catalog of its codec or base.
 

@@ -99,6 +99,7 @@ pub const DEFAULT_BUILTINS: &[&str] = &[
     "read",
     "sessions",
     "skill",
+    "synthetic",
     "task",
     "thinking",
     "todo_write",

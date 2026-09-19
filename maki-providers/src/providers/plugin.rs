@@ -5,7 +5,7 @@ use std::sync::{Arc, LazyLock, Mutex, RwLock};
 
 use flume::Sender;
 use maki_config::host_allowed;
-use maki_config::providers::{ImplChoice, Protocol, ProvidersConfig};
+use maki_config::providers::{ImplChoice, Protocol, ProviderDef, ProvidersConfig};
 use maki_storage::StateDir;
 use maki_storage::auth::lock_credentials;
 use maki_storage::id::SessionRef;
@@ -23,7 +23,7 @@ use crate::types::{EffortDialect, ThinkingFields, dialect};
 use crate::{AgentError, Message, ProviderEvent, ProviderUsage, RequestOptions, StreamResponse};
 
 use super::codec::{self, BodyHook, CodecOptions};
-use super::{KeyHeader, KeyPool, KeyRotation, ResolvedAuth, Timeouts};
+use super::{KeyHeader, KeyPool, KeyRotation, ResolvedAuth, Timeouts, synthetic};
 
 const DEFAULT_MAX_OUTPUT_TOKENS: u32 = 16384;
 const DEFAULT_CONTEXT_WINDOW: u32 = 128_000;
@@ -32,6 +32,7 @@ const SYSTEM_PREFIX_OPTION: &str = "system_prefix";
 const DISPLAY_NAME_FIELD: &str = "display_name";
 const API_KEY_ENV_FIELD: &str = "api_key_env";
 const MODELS_FIELD: &str = "models";
+const IMPL_FIELD: &str = "impl";
 const HTTPS_SCHEME: &str = "https";
 const HTTP_SCHEME: &str = "http";
 const LOCALHOST: &str = "localhost";
@@ -315,6 +316,8 @@ pub enum RegisterError {
     InvalidSlug(String),
     #[error("provider slug '{0}' is already defined in providers.toml")]
     ConfiguredSlug(String),
+    #[error("provider '{slug}': {message}")]
+    Credentials { slug: String, message: String },
     #[error("provider '{0}' is already registered")]
     DuplicateSlug(String),
     #[error("provider '{0}' must set a display_name")]
@@ -452,10 +455,13 @@ static AUTH: LazyLock<RwLock<HashMap<Box<str>, Arc<AuthState>>>> = LazyLock::new
 /// because one list read top to bottom is how anyone tells which providers are
 /// ported.
 ///
-/// Empty for now: each port appends its constructor here (`anthropic::decl`),
-/// and the list -- with the seeding in [`begin_load`] and the precedence in
-/// [`wins`] -- goes away with the last provider that still needs it.
-const RUST_DECLS: &[fn() -> Registration] = &[];
+/// Each port appends its constructor here (`anthropic::decl`), and the list --
+/// with the seeding in [`begin_load`] and the precedence in [`wins`] -- goes
+/// away with the last provider that still needs it.
+const RUST_DECLS: &[fn() -> Registration] = &[|| Registration {
+    decl: synthetic::decl(),
+    hooks: ProviderHooks::default(),
+}];
 
 /// Opens the registration window, at the top of every plugin load.
 ///
@@ -579,7 +585,14 @@ fn register_decl(reg: Registration, source: DeclSource) -> Result<(), RegisterEr
     // has no row for is still nobody's to claim -- there would be nothing to
     // inherit and the name would collide with a future built-in.
     let claimed = ProviderRegistry::get(&slug);
-    if config_entry.is_some() {
+    // Only a slug maki does not already own can be lost to `providers.toml`.
+    // An entry under a built-in slug has never defined a provider -- the
+    // built-in keeps the slug and the entry overlays what
+    // [`maki_config::providers::ignored_builtin_fields`] does not name, which
+    // is how `[synthetic] base_url` points the shipped provider at a gateway.
+    // Rejecting the claim over one would delete the provider the overlay was
+    // written for, and would delete it for the Rust-authored declaration too.
+    if claimed.is_none() && config_entry.is_some_and(defines_provider) {
         return Err(RegisterError::ConfiguredSlug(slug));
     }
     if decl.net_hosts.is_empty() {
@@ -661,6 +674,22 @@ fn register_decl(reg: Registration, source: DeclSource) -> Result<(), RegisterEr
 /// The env var this declaration's key comes out of: its own, or the claimed
 /// row's. Empty means the provider has no key env at all (Ollama's host,
 /// Aperture's gateway), which is the same as declaring none.
+/// Whether a `providers.toml` entry defines a provider of its own, as opposed
+/// to only naming which of two declarations serves the slug. An `impl` line is
+/// there to choose between them, so counting it as a definition would reject
+/// both and leave the slug with nothing.
+///
+/// Asked of the serialised form rather than field by field: every field of
+/// [`ProviderDef`] is skipped when unset, so one added later counts without
+/// being listed here, and anything that does not serialise to an object counts
+/// as a definition.
+fn defines_provider(def: &ProviderDef) -> bool {
+    let Ok(Value::Object(fields)) = serde_json::to_value(def) else {
+        return true;
+    };
+    fields.keys().any(|field| field != IMPL_FIELD)
+}
+
 fn api_key_env(decl: &ProviderDecl, claimed: Option<&'static ProviderSpec>) -> Option<String> {
     decl.api_key_env
         .as_deref()
@@ -770,8 +799,11 @@ impl DeclaredKeys {
             Self::Hooked | Self::Missing { .. } => ResolvedAuth::new(slug, Vec::new()),
         };
         // `ResolvedAuth` only fails over `[<slug>.headers]` in providers.toml,
-        // and a slug that appears there was already rejected at registration.
-        auth.map_err(|_| RegisterError::ConfiguredSlug(slug.to_string()))
+        // which a declaration claiming a built-in slug is allowed to have.
+        auth.map_err(|e| RegisterError::Credentials {
+            slug: slug.to_string(),
+            message: e.to_string(),
+        })
     }
 }
 
@@ -1266,8 +1298,55 @@ pub fn display_name(slug: &str) -> Option<String> {
     entry(slug).map(|entry| entry.display_name().to_owned())
 }
 
+/// The credentials a registered slug currently holds, for a hook that has to
+/// reach an endpoint the codec knows nothing about. A snapshot, like the one
+/// every codec takes per request, so a refresh landing mid-call cannot swap the
+/// headers a request is already building.
+pub fn resolved_auth(slug: &str) -> Option<ResolvedAuth> {
+    Some(entry(slug)?.auth.current.lock().unwrap().clone())
+}
+
 pub fn base_for_slug(slug: &str) -> Option<&'static ProviderSpec> {
     entry(slug)?.spec()
+}
+
+/// The declaration maki itself authors for `slug`, which is not always the one
+/// serving it: a Lua author's decl for the same slug outranks it unless
+/// `impl = "rust"` says otherwise. Read straight off [`RUST_DECLS`], so it
+/// answers whether or not a load has happened.
+pub fn rust_decl(slug: &str) -> Option<ProviderDecl> {
+    RUST_DECLS
+        .iter()
+        .map(|declare| declare().decl)
+        .find(|decl| decl.slug == slug)
+}
+
+/// The declaration serving `slug` right now, whoever authored it.
+pub fn registered_decl(slug: &str) -> Option<ProviderDecl> {
+    Some(entry(slug)?.decl.clone())
+}
+
+/// A provider for `slug` built against auth the caller resolved, for a caller
+/// that routes a request onto another provider's wire rather than owning the
+/// credentials. `None` when no declaration drives a codec for the slug, which
+/// leaves the caller its own fallback.
+///
+/// `system_prefix` is the routing caller's, and it outranks the declared one
+/// for the same reason the native path takes it as an argument: it belongs to
+/// the session, not to the provider.
+pub fn build_with_auth(
+    slug: &str,
+    auth: Arc<Mutex<ResolvedAuth>>,
+    timeouts: Timeouts,
+    system_prefix: Option<String>,
+) -> Option<Box<dyn Provider>> {
+    let entry = entry(slug)?;
+    let Target::Codec(protocol) = entry.target else {
+        return None;
+    };
+    let mut options = codec_options(&entry, protocol);
+    options.system_prefix = system_prefix.or(options.system_prefix);
+    Some(codec::build(options, auth, timeouts))
 }
 
 pub fn lookup_model(slug: &str, model_id: &str) -> Option<Model> {
@@ -1917,9 +1996,10 @@ mod tests {
         reg.decl.base_url = Some(format!("http://{EXAMPLE_HOST}/v1"));
     }
 
-    /// `ConfiguredSlug` has no row, for a claim or for a new slug: reaching it
-    /// needs a `providers.toml` entry for the slug, and the process-wide
-    /// config is not a test fixture.
+    /// `ConfiguredSlug` and `Credentials` have no row: both need a
+    /// `providers.toml` entry for the slug, and the process-wide config is not
+    /// a test fixture. They are covered out of line, in
+    /// `tests/configured_overlay.rs`.
     #[test_case(bad_slug, |e| matches!(e, RegisterError::InvalidSlug(_)) ; "invalid_slug")]
     #[test_case(no_display_name, |e| matches!(e, RegisterError::NoDisplayName(_)) ; "display_name_is_mandatory_without_a_row_to_inherit_it_from")]
     #[test_case(claim_restating_the_display_name, |e| matches!(e, RegisterError::Restated { field, .. } if *field == DISPLAY_NAME_FIELD) ; "claim_restates_display_name")]
@@ -1947,9 +2027,9 @@ mod tests {
         commit_load();
     }
 
-    /// Stands in for [`RUST_DECLS`], which is empty until the ports land: a
-    /// Rust-authored decl staged first, exactly as [`begin_load`] will stage
-    /// the real ones before any plugin gets to speak.
+    /// What [`begin_load`] does with [`RUST_DECLS`], for a slug maki ships no
+    /// declaration for: a Rust-authored decl staged before any plugin gets to
+    /// speak.
     fn load_with_rust_decl(slug: &str) {
         begin_load();
         register(registration(slug), DeclSource::Rust).unwrap();
@@ -1972,6 +2052,16 @@ mod tests {
             DeclSource::Rust
         };
         assert_eq!(served, expected);
+    }
+
+    /// The escape hatch has to survive the check that follows it: `impl` is
+    /// how a user picks between two declarations, so an entry carrying only
+    /// that is not a `providers.toml` provider and must not reject both.
+    #[test_case(ProviderDef::default(), false ; "an_empty_entry_defines_nothing")]
+    #[test_case(ProviderDef { r#impl: Some(ImplChoice::Rust), ..ProviderDef::default() }, false ; "impl_alone_only_picks_the_author")]
+    #[test_case(ProviderDef { base_url: Some(EXAMPLE_BASE_URL.to_owned()), r#impl: Some(ImplChoice::Rust), ..ProviderDef::default() }, true ; "anything_else_is_a_definition")]
+    fn a_configured_entry_defines_a_provider(def: ProviderDef, expected: bool) {
+        assert_eq!(defines_provider(&def), expected);
     }
 
     #[test]

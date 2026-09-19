@@ -10,14 +10,14 @@ use tracing::warn;
 use crate::model::{Model, ModelFamily, ModelInfo, ModelPricing, ThinkingSupport, lookup_entry};
 use crate::provider::{BoxFuture, Provider};
 use crate::spec::{
-    ApertureRoute, AuthDoc, CatalogDoc, GeneratedDocs, LoginConfig, NO_CURATED_MODELS, Native,
-    ProviderRegistry, ProviderSpec,
+    AuthDoc, CatalogDoc, GeneratedDocs, LoginConfig, NO_CURATED_MODELS, Native, ProviderRegistry,
+    ProviderSpec,
 };
 use crate::{AgentError, Message, ProviderEvent, RequestOptions, StreamResponse};
 use maki_storage::id::SessionRef;
 
 use super::openai_compat::{OpenAiCompatConfig, OpenAiCompatProvider};
-use super::{ResolvedAuth, Timeouts, google};
+use super::{ResolvedAuth, Timeouts, google, plugin};
 
 const HOST_ENV: &str = "APERTURE_HOST";
 const PER_MILLION: f64 = 1_000_000.0;
@@ -158,11 +158,7 @@ fn routed_spec(provider_id: &str, merged: &OverrideFields) -> Option<&'static Pr
     [merged.base.as_deref(), Some(provider_id)]
         .into_iter()
         .flatten()
-        .find_map(|s| ProviderRegistry::get(s).filter(|spec| aperture_route(spec).is_some()))
-}
-
-fn aperture_route(spec: &ProviderSpec) -> Option<ApertureRoute> {
-    spec.aperture
+        .find_map(|s| ProviderRegistry::get(s).filter(|spec| spec.aperture.is_some()))
 }
 
 /// A model that routes nowhere still has to reach the gateway, so it falls back
@@ -171,7 +167,7 @@ fn aperture_route(spec: &ProviderSpec) -> Option<ApertureRoute> {
 fn path_prefix(spec: Option<&'static ProviderSpec>, merged: &OverrideFields) -> String {
     let Some(configured) = merged.path_prefix.as_deref() else {
         return spec
-            .and_then(aperture_route)
+            .and_then(|s| s.aperture)
             .map_or(DEFAULT_PATH_PREFIX, |r| r.path_prefix)
             .to_string();
     };
@@ -250,6 +246,28 @@ impl Aperture {
     pub(crate) fn with_system_prefix(mut self, prefix: Option<String>) -> Self {
         self.system_prefix = prefix.filter(|s| !s.is_empty());
         self
+    }
+
+    /// The provider a route streams through, from whichever mechanism owns the
+    /// slug now. A built-in that has been ported to a declaration has no
+    /// `native` constructor left, and without the first lookup Aperture would
+    /// quietly stop routing onto it and send all of its models down the generic
+    /// gateway path. The second lookup goes when the last provider ports.
+    fn routed_provider(
+        &self,
+        spec: &'static ProviderSpec,
+        auth: Arc<Mutex<ResolvedAuth>>,
+    ) -> Option<Box<dyn Provider>> {
+        plugin::build_with_auth(
+            spec.slug,
+            Arc::clone(&auth),
+            self.timeouts,
+            self.system_prefix.clone(),
+        )
+        .or_else(|| {
+            spec.native
+                .map(|n| (n.with_auth)(auth, self.timeouts, self.system_prefix.clone()))
+        })
     }
 }
 
@@ -366,9 +384,8 @@ impl Provider for Aperture {
             let spec = routed_spec(provider_id, &ov);
             let auth = routed_auth(&self.auth, &path_prefix(spec, &ov));
             if let Some(spec) = spec
-                && let Some(native) = spec.native
+                && let Some(provider) = self.routed_provider(spec, Arc::clone(&auth))
             {
-                let provider = (native.with_auth)(auth, self.timeouts, self.system_prefix.clone());
                 let request_model = native_route_model(model, spec, model_id);
                 return provider
                     .stream_message(
@@ -410,13 +427,11 @@ impl Provider for Aperture {
             let model_id = model_id.to_string();
             let ov = merged_override(&self.overrides, provider_id, &model_id);
             if let Some(spec) = routed_spec(provider_id, &ov)
-                && let Some(native) = spec.native
-            {
-                let routed = (native.with_auth)(
+                && let Some(routed) = self.routed_provider(
+                    spec,
                     routed_auth(&self.auth, &path_prefix(Some(spec), &ov)),
-                    self.timeouts,
-                    self.system_prefix.clone(),
-                );
+                )
+            {
                 let full_id = std::mem::replace(&mut model.id, model_id);
                 routed.adjust_model(model);
                 model.id = full_id;

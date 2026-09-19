@@ -213,8 +213,13 @@ impl ProviderRegistry {
         BUILTINS
     }
 
-    /// The slugs a registered plugin or a `providers.toml` entry may not
-    /// claim, and the ones a plugin may name as its `base`.
+    /// The slugs a plugin may name as its `base`. A `base` borrows a bespoke
+    /// `impl Provider` whole, so a built-in that has moved onto a declaration
+    /// has nothing left to lend and drops out of here.
+    ///
+    /// Claiming a slug is a different question and no longer a veto: a
+    /// declaration naming a built-in slug takes it over and inherits its
+    /// config row. See [`crate::providers::plugin::register`].
     pub fn native_slugs() -> impl Iterator<Item = &'static str> {
         BUILTINS.iter().filter(|s| s.is_native()).map(|s| s.slug)
     }
@@ -234,8 +239,8 @@ impl ProviderRegistry {
 /// knows about a slug: a catalog-backed builtin has a spec row and is still
 /// `Catalog` here.
 pub enum Owner {
-    /// A registered declaration, whoever authored it -- a Lua plugin or maki's
-    /// own Rust list.
+    /// A registered declaration, whether a Lua plugin wrote it or maki's own
+    /// Rust list did.
     Plugin,
     /// Carries the constructor rather than the spec, so "builtin" and
     /// "buildable" cannot come apart.
@@ -249,23 +254,20 @@ pub enum Owner {
 
 impl Owner {
     pub fn of(slug: &str) -> Self {
-        // A registered declaration answers first, built-in row or not: the decl
-        // is what constructs the slug now, and a built-in that has been ported
-        // is exactly a slug with both a row and a decl.
-        //
-        // While a provider still has a bespoke `native` impl and no decl
-        // nothing changes for it -- the honest shape of a half-done migration,
-        // and what makes the ports land one at a time.
+        // A declaration answers first, built-in row or not: once a slug has
+        // one, that is what builds it. A provider still on a bespoke `native`
+        // impl keeps its old path, which is how the ports land one at a time.
         if plugin::is_registered(slug) {
             return Self::Plugin;
         }
-        if let Some(native) = ProviderRegistry::get(slug).and_then(|s| s.native) {
+        let builtin = ProviderRegistry::get(slug);
+        if let Some(native) = builtin.and_then(|s| s.native) {
             return Self::Builtin(native.new);
         }
         if custom::base_spec(slug).is_some() {
             return Self::Custom;
         }
-        if ProviderRegistry::get(slug).is_some() {
+        if builtin.is_some() {
             return Self::Catalog;
         }
         Self::Unknown
@@ -282,12 +284,22 @@ mod tests {
     /// is only the right filter while the registry is exactly what maki builds
     /// plus what it deliberately reads from the catalog. A duplicate slug would
     /// vanish into the set, so count before comparing.
+    ///
+    /// A ported provider is built from a declaration, so it is neither native
+    /// nor catalog-backed. Reading that third set off maki's own declarations
+    /// means the next port needs no edit here, while a row nothing builds any
+    /// more still fails.
     #[test]
-    fn builtins_are_the_native_and_catalog_backed_slugs() {
+    fn builtins_are_the_native_declared_and_catalog_backed_slugs() {
         let registry: HashSet<&str> = BUILTINS.iter().map(|s| s.slug).collect();
         assert_eq!(registry.len(), BUILTINS.len(), "duplicate slug in BUILTINS");
+        let declared = BUILTINS
+            .iter()
+            .map(|s| s.slug)
+            .filter(|slug| plugin::rust_decl(slug).is_some());
         let expected: HashSet<&str> = ProviderRegistry::native_slugs()
             .chain(CATALOG_BACKED_BUILTINS.iter().copied())
+            .chain(declared)
             .collect();
         assert_eq!(registry, expected);
     }

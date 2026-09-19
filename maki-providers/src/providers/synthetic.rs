@@ -1,23 +1,11 @@
-use std::borrow::Cow;
-use std::sync::{Arc, Mutex};
-
-use flume::Sender;
-use maki_storage::id::SessionRef;
-use serde_json::Value;
-
 use maki_config::providers::Protocol;
 
-use crate::model::{Model, ModelFamily};
-use crate::provider::{BoxFuture, Provider};
+use crate::dialect;
+use crate::model::ModelFamily;
 use crate::providers::aperture::DEFAULT_PATH_PREFIX;
-use crate::spec::{
-    ApertureRoute, AuthDoc, CatalogDoc, GeneratedDocs, LoginConfig, Native, ProviderSpec,
-};
-use crate::{AgentError, Message, ProviderEvent, RequestOptions, StreamResponse, dialect};
+use crate::spec::{ApertureRoute, AuthDoc, CatalogDoc, GeneratedDocs, LoginConfig, ProviderSpec};
 
-use super::openai_compat::{OpenAiCompatConfig, OpenAiCompatProvider};
 use super::plugin::ProviderDecl;
-use super::{KeyHeader, KeyPool, KeyRotation, ResolvedAuth, Timeouts};
 
 const SLUG: &str = "synthetic";
 const DISPLAY_NAME: &str = "Synthetic";
@@ -28,15 +16,6 @@ const LOGIN_URL: &str = "https://synthetic.new";
 const MAX_TOKENS_FIELD: &str = "max_completion_tokens";
 const FEATURES: &str = "Reasoning effort support (low/medium/high), open-weight models";
 const NET_HOST: &str = "api.synthetic.new";
-
-static CONFIG: OpenAiCompatConfig = OpenAiCompatConfig {
-    slug: Cow::Borrowed(SLUG),
-    api_key_env: Cow::Borrowed(ENV_VAR),
-    base_url: Cow::Borrowed(BASE_URL),
-    max_tokens_field: Cow::Borrowed(MAX_TOKENS_FIELD),
-    include_stream_usage: false,
-    provider_name: Cow::Borrowed(DISPLAY_NAME),
-};
 
 pub(crate) const SPEC: ProviderSpec = ProviderSpec {
     slug: SLUG,
@@ -49,10 +28,7 @@ pub(crate) const SPEC: ProviderSpec = ProviderSpec {
     fallback_context_window: 128_000,
     models_toml: include_str!("../../models/synthetic.toml"),
     pricing_schedule: None,
-    native: Some(Native {
-        new: create,
-        with_auth: create_with_auth,
-    }),
+    native: None,
     aperture: Some(ApertureRoute {
         path_prefix: DEFAULT_PATH_PREFIX,
     }),
@@ -73,18 +49,6 @@ pub(crate) const SPEC: ProviderSpec = ProviderSpec {
     },
 };
 
-fn create(timeouts: Timeouts) -> Result<Box<dyn Provider>, AgentError> {
-    Ok(Box::new(Synthetic::new(timeouts)?))
-}
-
-fn create_with_auth(
-    auth: Arc<Mutex<ResolvedAuth>>,
-    timeouts: Timeouts,
-    system_prefix: Option<String>,
-) -> Box<dyn Provider> {
-    Box::new(Synthetic::with_auth(auth, timeouts).with_system_prefix(system_prefix))
-}
-
 inventory::submit!(SPEC.config_row());
 
 /// This provider as a declaration, which is all of it: the openai codec spells
@@ -95,9 +59,10 @@ inventory::submit!(SPEC.config_row());
 /// limits and the curated model table, and restating any of them is a
 /// registration error rather than a second home for the same fact.
 ///
-/// Not in any startup list yet: the port that deletes the bespoke [`Synthetic`]
-/// below registers it, and until then the replay suite is what builds it.
-#[cfg_attr(not(test), allow(dead_code))]
+/// Staged at every load from [`crate::providers::plugin`]'s list of the
+/// declarations maki authors, and outranked there by the bundled `synthetic`
+/// Lua plugin, which restates this same declaration on the authoring surface a
+/// third-party plugin uses.
 pub(crate) fn decl() -> ProviderDecl {
     ProviderDecl {
         slug: SLUG.to_owned(),
@@ -115,101 +80,24 @@ pub(crate) fn decl() -> ProviderDecl {
     }
 }
 
-pub struct Synthetic {
-    compat: OpenAiCompatProvider,
-    auth: Arc<Mutex<ResolvedAuth>>,
-    key_pool: Option<KeyPool>,
-    system_prefix: Option<String>,
-}
-
-impl Synthetic {
-    pub fn new(timeouts: super::Timeouts) -> Result<Self, AgentError> {
-        let pool = KeyPool::resolve(&CONFIG.slug, &CONFIG.api_key_env)?;
-        Ok(Self {
-            compat: OpenAiCompatProvider::new(&CONFIG, timeouts),
-            auth: Arc::new(Mutex::new(ResolvedAuth::bearer(
-                &CONFIG.slug,
-                pool.current(),
-            )?)),
-            key_pool: Some(pool),
-            system_prefix: None,
-        })
-    }
-
-    pub(crate) fn with_auth(auth: Arc<Mutex<ResolvedAuth>>, timeouts: super::Timeouts) -> Self {
-        Self {
-            compat: OpenAiCompatProvider::new(&CONFIG, timeouts),
-            auth,
-            key_pool: None,
-            system_prefix: None,
-        }
-    }
-
-    pub(crate) fn with_system_prefix(mut self, prefix: Option<String>) -> Self {
-        self.system_prefix = prefix;
-        self
-    }
-}
-
-impl Provider for Synthetic {
-    fn stream_message<'a>(
-        &'a self,
-        model: &'a Model,
-        messages: &'a [Message],
-        system: &'a str,
-        tools: &'a Value,
-        event_tx: &'a Sender<ProviderEvent>,
-        opts: RequestOptions,
-        _session_id: Option<&'a SessionRef>,
-    ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
-        Box::pin(async move {
-            let auth = self.auth.lock().unwrap().clone();
-            let mut buf = String::new();
-            let system = super::with_prefix(&self.system_prefix, system, &mut buf);
-            let mut body = self.compat.build_body(model, messages, system, tools);
-            opts.thinking
-                .apply_reasoning_effort(&mut body, &dialect::STANDARD, model);
-            self.compat
-                .do_stream(model, &[], &body, event_tx, &auth)
-                .await
-        })
-    }
-
-    fn list_models(&self) -> BoxFuture<'_, Result<Vec<crate::model::ModelInfo>, AgentError>> {
-        Box::pin(async move {
-            let auth = self.auth.lock().unwrap().clone();
-            self.compat.do_list_models(&auth).await
-        })
-    }
-
-    fn keys(&self) -> Option<KeyRotation<'_>> {
-        Some(KeyRotation::new(
-            self.key_pool.as_ref()?,
-            &self.auth,
-            KeyHeader::Bearer,
-        ))
-    }
-}
-
-/// The port of Synthetic onto [`decl`], proved one recorded exchange at a
-/// time: every fixture runs through the declaration and through the bespoke
-/// [`Synthetic`] above, and both are held against the same golden artifact.
+/// Synthetic as [`decl`] puts it on the wire, one recorded exchange at a time.
 ///
-/// The goldens outlive the comparison. When the bespoke impl goes, the second
-/// half of each test goes with it and every case is still pinned to what this
-/// provider put on the wire on the day it was ported.
+/// Every case was recorded while the bespoke `impl Provider` this module used
+/// to hold was still here, running both against the same artifact. The impl is
+/// gone and the artifacts are not: each fixture is still pinned to the bytes
+/// and the events that provider produced on the day it was ported.
 #[cfg(test)]
 mod tests {
     use tempfile::TempDir;
     use test_case::test_case;
 
     use crate::model::Model;
-    use crate::providers::plugin::{self, DeclSource, ProviderHooks, Registration};
     use crate::providers::replay::{self, Fixture};
+    use crate::providers::{Timeouts, plugin};
     use crate::test_support::Canned;
     use crate::{Effort, ThinkingConfig};
 
-    use super::{ENV_VAR, SLUG, Synthetic, Timeouts};
+    use super::{ENV_VAR, SLUG};
 
     const MODEL_SPEC: &str = "synthetic/hf:moonshotai/Kimi-K2.5";
     const BASE_URL_ENV: &str = "SYNTHETIC_BASE_URL";
@@ -220,7 +108,6 @@ mod tests {
 
     const TEMPDIR_FAILED: &str = "no temporary state directory";
     const UNKNOWN_MODEL: &str = "the curated table has no such model";
-    const REGISTER_FAILED: &str = "the declaration was rejected";
     const CREATE_FAILED: &str = "the provider could not be built";
 
     const UNAUTHORIZED_BODY: &str = r#"{"error":{"message":"invalid api key"}}"#;
@@ -355,20 +242,13 @@ data: {"choices":[{"delta":{"con"#;
         unsafe { std::env::set_var(BASE_URL_ENV, base_url) };
     }
 
-    /// The real construction path rather than a hand-built
-    /// [`crate::providers::codec::CodecOptions`]: `create` resolves the
-    /// *inherited* `api_key_env` into a key pool eagerly, so the claim on the
-    /// built-in slug is exercised instead of assumed.
+    /// The startup path rather than a hand-built registration: a load with no
+    /// plugin in it stages exactly the declarations maki authors, and
+    /// `create` resolves the *inherited* `api_key_env` into a key pool
+    /// eagerly, so the claim on the built-in slug is exercised instead of
+    /// assumed.
     fn register_decl() {
         plugin::begin_load();
-        plugin::register(
-            Registration {
-                decl: super::decl(),
-                hooks: ProviderHooks::default(),
-            },
-            DeclSource::Rust,
-        )
-        .expect(REGISTER_FAILED);
         plugin::commit_load();
     }
 
@@ -383,7 +263,7 @@ data: {"choices":[{"delta":{"con"#;
     #[test_case(&MALFORMED ; "malformed_sse")]
     #[test_case(&EMPTY_ERROR ; "empty_sse_error_frame")]
     #[test_case(&TRUNCATED ; "truncated_stream")]
-    fn the_declaration_replays_the_bespoke_impl(fixture: &Fixture) {
+    fn the_declaration_replays_the_recorded_exchange(fixture: &Fixture) {
         let _isolated = isolated();
         let model = Model::from_spec(MODEL_SPEC).expect(UNKNOWN_MODEL);
         register_decl();
@@ -393,11 +273,5 @@ data: {"choices":[{"delta":{"con"#;
             plugin::create(SLUG, Timeouts::default()).expect(CREATE_FAILED)
         });
         replay::assert_golden(SLUG, fixture, &declared);
-
-        let bespoke = replay::run(fixture, &model, |base_url| {
-            point_at(base_url);
-            Box::new(Synthetic::new(Timeouts::default()).expect(CREATE_FAILED))
-        });
-        replay::assert_ported(fixture, &declared, &bespoke);
     }
 }

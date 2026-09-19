@@ -1,26 +1,37 @@
 //! Golden replay: one recorded exchange, one provider, one artifact on disk.
 //!
-//! A provider is worth comparing on four things, and this compares all four:
-//! the request bytes it put on the wire, the [`ProviderEvent`]s it emitted in
-//! order, the error it failed with, and the usage it came back with. Every
-//! case is recorded as a golden file, so the suite keeps its teeth when the
-//! implementation it was originally written to compare against is deleted --
-//! a differential test dies with either of its two sides, a golden does not.
+//! Four things about a provider are worth comparing and this compares all
+//! four: the request bytes it put on the wire, the [`ProviderEvent`]s it
+//! emitted in order, the error it failed with, and the usage it came back
+//! with. Each case lands in a golden file, so the suite keeps its teeth once
+//! the implementation it was first written against is deleted. A differential
+//! test dies with either of its two sides, a golden does not.
+//!
+//! Every entry point takes the authoring to replay, because an artifact that
+//! only ever saw the declaration maki *doesn't* ship proves the wrong thing:
+//! the bundled Lua decl outranks the Rust one at every real startup. This
+//! crate can stage its own declarations ([`rust_authoring`]) and `maki-lua`
+//! boots the plugin host and registers the bundled decl over the top, both
+//! against these same files.
 //!
 //! Regenerate with `UPDATE_GOLDENS=1 cargo nextest run -p maki-providers`.
-//! A *missing* golden always fails: a suite that records whatever it sees the
-//! first time it runs has asserted nothing.
+//! A *missing* golden always fails, because a suite that records whatever it
+//! sees on its first run has asserted nothing.
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
+use maki_config::providers::base_url_env_var;
 use serde_json::{Value, json};
+use tempfile::TempDir;
 
-use crate::model::{Model, TokenUsage};
+use crate::model::Model;
 use crate::provider::Provider;
+use crate::spec::ProviderRegistry;
 use crate::test_support::{Canned, Recorded, Requests, serve};
-use crate::tokens::ContextGauge;
 use crate::{AgentError, Message, ProviderEvent, RequestOptions, StreamResponse, ThinkingConfig};
+
+use super::{Timeouts, plugin};
 
 const GOLDEN_DIR: &str = "tests/goldens";
 const UPDATE_ENV: &str = "UPDATE_GOLDENS";
@@ -36,14 +47,33 @@ const SYSTEM: &str = "You are a replay fixture.";
 const TOOL_NAME: &str = "read";
 const TOOL_DESCRIPTION: &str = "Read a file";
 
+const API_KEY: &str = "sk-replay";
+const HOME_VARS: &[&str] = &[
+    "HOME",
+    "XDG_STATE_HOME",
+    "XDG_CONFIG_HOME",
+    "XDG_DATA_HOME",
+    "XDG_CACHE_HOME",
+];
+
+const UNAUTHORIZED_BODY: &str = r#"{"error":{"message":"invalid api key"}}"#;
+const RATE_LIMITED_BODY: &str = r#"{"error":{"message":"too many requests"}}"#;
+const SERVER_ERROR_BODY: &str = r#"{"error":{"message":"internal error"}}"#;
+const RETRY_AFTER_HEADERS: &[(&str, &str)] =
+    &[("content-type", "application/json"), ("retry-after", "7")];
+
 const NO_GOLDEN_DIR: &str = "the golden directory has no parent";
 const WRITE_FAILED: &str = "the golden could not be recorded";
 const BAD_GOLDEN: &str = "the golden on disk is not json";
 const NOT_AN_OBJECT: &str = "an observation is always a json object";
+const NO_REQUESTS: &str = "every observation records the requests it sent";
+const TEMPDIR_FAILED: &str = "no temporary state directory";
+const NOT_A_BUILTIN: &str = "a replayed slug is a builtin";
+const CREATE_FAILED: &str = "the provider could not be built";
 
 /// One replayed exchange: what the server answers with, and what the request
 /// asks for beyond the fixed prompt.
-pub(crate) struct Fixture {
+pub struct Fixture {
     pub name: &'static str,
     /// An upper bound on the requests a run may send, not a promise that it
     /// sends them all: a provider that retries internally draws a second
@@ -52,9 +82,90 @@ pub(crate) struct Fixture {
     pub thinking: ThinkingConfig,
 }
 
+// The failures below look the same whichever provider hits them, so they are
+// written once here and every port replays the ones it answers. Each provider
+// still gets its own golden, since the name of a fixture is the name of its
+// file inside the provider's directory.
+
+/// A rejected key. The second answer is one neither side is expected to ask
+/// for: a provider that replays the rejected key is recorded as a second
+/// request instead of parking on an `accept` that never returns.
+pub const UNAUTHORIZED: Fixture = Fixture {
+    name: "unauthorized",
+    script: &[
+        Canned::json(401, UNAUTHORIZED_BODY),
+        Canned::json(401, UNAUTHORIZED_BODY),
+    ],
+    thinking: ThinkingConfig::Off,
+};
+
+pub const RATE_LIMITED: Fixture = Fixture {
+    name: "rate_limited",
+    script: &[Canned::json(429, RATE_LIMITED_BODY)],
+    thinking: ThinkingConfig::Off,
+};
+
+/// The same 429 with the header that tells us how long to wait, which is the
+/// one thing downstream backoff reads off a rate limit.
+pub const SLOW_DOWN: Fixture = Fixture {
+    name: "rate_limited_with_retry_after",
+    script: &[Canned {
+        status: 429,
+        headers: RETRY_AFTER_HEADERS,
+        body: RATE_LIMITED_BODY,
+    }],
+    thinking: ThinkingConfig::Off,
+};
+
+pub const SERVER_ERROR: Fixture = Fixture {
+    name: "server_error",
+    script: &[Canned::json(500, SERVER_ERROR_BODY)],
+    thinking: ThinkingConfig::Off,
+};
+
+/// One unparseable frame between two good ones: the bad frame is skipped and
+/// the turn still ends, rather than the whole stream failing.
+pub const MALFORMED_SSE: Fixture = Fixture {
+    name: "malformed_sse",
+    script: &[Canned::sse(
+        r#"data: {"choices": [ this is not json
+
+data: {"choices":[{"delta":{"content":"Hello"}}]}
+
+data: [DONE]
+
+"#,
+    )],
+    thinking: ThinkingConfig::Off,
+};
+
+/// An error frame on a 200, carrying a tag but no message. The substituted
+/// message is a real bug fix (`EMPTY_SSE_ERROR_MESSAGE`): without it the turn
+/// ended with an empty assistant message and no retry.
+pub const EMPTY_SSE_ERROR: Fixture = Fixture {
+    name: "empty_sse_error_frame",
+    script: &[Canned::sse(
+        r#"data: {"error":{"type":"server_error","message":""}}
+
+"#,
+    )],
+    thinking: ThinkingConfig::Off,
+};
+
+/// Ends mid-frame, with no `finish_reason` and no `[DONE]`.
+pub const TRUNCATED_STREAM: Fixture = Fixture {
+    name: "truncated_stream",
+    script: &[Canned::sse(
+        r#"data: {"choices":[{"delta":{"content":"Hel"}}]}
+
+data: {"choices":[{"delta":{"con"#,
+    )],
+    thinking: ThinkingConfig::Off,
+};
+
 /// The question every fixture asks, so two providers driven by this harness
 /// are never answering different ones.
-pub(crate) fn tools() -> Value {
+pub fn tools() -> Value {
     json!([{
         "name": TOOL_NAME,
         "description": TOOL_DESCRIPTION,
@@ -70,34 +181,30 @@ fn turn() -> Vec<Message> {
     vec![Message::user(PROMPT.to_owned())]
 }
 
-/// Runs `fixture` against the provider `build` returns, pointed at a freshly
-/// bound recorded server.
-///
-/// `build` takes the origin rather than the harness publishing it, because
-/// which of the three base-url mechanisms reaches a given provider is the
-/// caller's problem: a provider reads its origin once, at construction, so
-/// the closure runs after the port is known.
-pub(crate) fn run(
-    fixture: &Fixture,
-    model: &Model,
-    build: impl FnOnce(&str) -> Box<dyn Provider>,
-) -> Value {
-    run_with(fixture, model, &turn(), &tools(), build)
+/// The stage step that leaves maki's own declarations in place: `begin_load`
+/// has already registered them, so a load with no plugin over the top serves
+/// exactly those. It is the same declaration `impl = "rust"` picks at runtime.
+pub fn rust_authoring() {}
+
+/// Replays `fixture` through the declaration `stage` left serving `slug` and
+/// pins everything that came back.
+pub fn declared<T>(stage: impl FnOnce() -> T, slug: &str, fixture: &Fixture, model: &Model) {
+    declared_with(stage, slug, fixture, model, &turn(), &tools());
 }
 
-/// [`run`] for a provider whose body work reads the history or the tool list.
-/// What it does to an assistant turn is invisible against the lone user
-/// message [`run`] sends, and what it does only when `tools` is present is
+/// [`declared`] for a provider whose body work reads the history or the tool
+/// list. What it does to an assistant turn is invisible against the lone user
+/// message [`declared`] sends, and what it does only when tools are present is
 /// invisible when they always are.
-pub(crate) fn run_with(
+pub fn declared_with<T>(
+    stage: impl FnOnce() -> T,
+    slug: &str,
     fixture: &Fixture,
     model: &Model,
     messages: &[Message],
     tools: &Value,
-    build: impl FnOnce(&str) -> Box<dyn Provider>,
-) -> Value {
-    let (base_url, requests) = serve(fixture.script);
-    let provider = build(&base_url);
+) {
+    let (provider, requests, _world) = build(slug, fixture, stage);
 
     let (tx, rx) = flume::unbounded();
     let result = smol::block_on(provider.stream_message(
@@ -115,29 +222,82 @@ pub(crate) fn run_with(
     drop(tx);
     let events: Vec<ProviderEvent> = rx.drain().collect();
 
-    json!({
-        REQUESTS_KEY: recorded(&requests),
-        "events": events,
-        "outcome": outcome(&result),
-    })
+    assert_golden(
+        slug,
+        fixture,
+        &json!({
+            REQUESTS_KEY: recorded(&requests),
+            "events": events,
+            "outcome": outcome(&result),
+        }),
+    );
 }
 
 /// The same recorded exchange for the other endpoint a provider answers on.
-/// Kept apart from [`run`] rather than folded into the `Fixture`: a usage call
-/// sends no messages, emits no events and has no thinking mode, so a shared
-/// entry point would carry three fields it never reads.
-pub(crate) fn run_usage(fixture: &Fixture, build: impl FnOnce(&str) -> Box<dyn Provider>) -> Value {
-    let (base_url, requests) = serve(fixture.script);
-    let provider = build(&base_url);
+/// Kept apart from [`declared`] rather than folded into the `Fixture`: a usage
+/// call sends no messages, emits no events and has no thinking mode, so a
+/// shared entry point would carry three fields it never reads.
+pub fn declared_usage<T>(stage: impl FnOnce() -> T, slug: &str, fixture: &Fixture) {
+    let (provider, requests, _world) = build(slug, fixture, stage);
     let result = smol::block_on(provider.fetch_usage());
 
-    json!({
-        REQUESTS_KEY: recorded(&requests),
-        "outcome": match &result {
-            Ok(usage) => json!({ "usage": usage }),
-            Err(e) => failure(e),
-        },
-    })
+    assert_golden(
+        slug,
+        fixture,
+        &json!({
+            REQUESTS_KEY: recorded(&requests),
+            "outcome": match &result {
+                Ok(usage) => json!({ "usage": usage }),
+                Err(e) => failure(e),
+            },
+        }),
+    );
+}
+
+/// Stands up the whole world one exchange needs: a throwaway home with the
+/// key the slug reads, the recorded server, and `slug` built through the
+/// startup path. `stage` registers inside the load window the way a plugin
+/// load does, and `create` resolves the inherited `api_key_env` into a key
+/// pool right away, so the claim on the built-in slug is exercised instead of
+/// assumed.
+///
+/// Staging and isolation come back as one guard the caller has to hold: the
+/// temporary tree is read while the request is built, and a hook whose plugin
+/// host has died answers nothing. In that order, so a host that writes on its
+/// way out still finds the home it was told to use.
+///
+/// Every base directory moves, so no run touches this machine's credentials,
+/// `providers.toml` or saved origins. The registry, the environment and the
+/// credential store are all process-global, and `cargo nextest` gives each
+/// test its own process, which is what keeps one fixture's key and origin out
+/// of the next one's.
+///
+/// Loopback is published through `<SLUG>_BASE_URL` because that is the only
+/// rung of the precedence a test can reach. The declaration's own `base_url`
+/// is the codec's *last* resort, so writing loopback there would mean
+/// registering a declaration that is not the one being ported, and
+/// `auth.base_url` is only ever written by an auth hook.
+fn build<T>(
+    slug: &str,
+    fixture: &Fixture,
+    stage: impl FnOnce() -> T,
+) -> (Box<dyn Provider>, Requests, (T, TempDir)) {
+    let home = TempDir::new().expect(TEMPDIR_FAILED);
+    for var in HOME_VARS {
+        unsafe { std::env::set_var(var, home.path()) };
+    }
+    let key_env = ProviderRegistry::get(slug)
+        .expect(NOT_A_BUILTIN)
+        .api_key_env;
+    unsafe { std::env::set_var(key_env, API_KEY) };
+
+    let (base_url, requests) = serve(fixture.script);
+    unsafe { std::env::set_var(base_url_env_var(slug), base_url) };
+    plugin::begin_load();
+    let staged = stage();
+    plugin::commit_load();
+    let provider = plugin::create(slug, Timeouts::default()).expect(CREATE_FAILED);
+    (provider, requests, (staged, home))
 }
 
 fn recorded(requests: &Requests) -> Value {
@@ -154,9 +314,9 @@ fn recorded(requests: &Requests) -> Value {
 /// The request as the observation keeps it: method, path, the header set and
 /// the body verbatim.
 ///
-/// The body stays a string rather than a parsed `Value` so the differential
-/// half compares the bytes a codec actually wrote, key order included. What
-/// reaches disk is canonicalised instead; see [`canonical_observation`].
+/// The body stays the string the codec wrote rather than a parsed `Value`, so
+/// nothing between here and the golden can quietly repair malformed JSON. What
+/// reaches disk is canonicalised instead, see [`canonical_observation`].
 fn request_value(recorded: &Recorded) -> Value {
     let headers: BTreeMap<&str, &str> = recorded
         .headers
@@ -191,34 +351,27 @@ fn outcome(result: &Result<StreamResponse, AgentError>) -> Value {
             "message": response.message,
             "usage": response.usage,
             "stop_reason": response.stop_reason,
-            "context_size": gauge_size(&response.usage),
+            // The one number a session's gauge takes from a response, and the
+            // separate usage fields above do not show which of them it sums.
+            "context_size": response.usage.total_input(),
         }),
-        // `AgentError` cannot be `PartialEq`, so [`AgentError::projection`] is
-        // the comparison -- `error.rs` carries a test proving two equal
-        // projections agree on every observable predicate, which a
-        // hand-rolled `(discriminant, status, message)` tuple would not.
-        // Written through `Debug` because the projection is a structural enum
-        // over `PartialEq` fields, so its debug form separates exactly what
-        // `==` does.
-        //
-        // The rendered message rides along because the projection reads the
-        // message only through those predicates, and some behaviour lives
-        // nowhere else: a provider that substitutes a message for an error
-        // frame that carried none projects identically to one that does not.
         Err(e) => failure(e),
     }
 }
 
+/// `AgentError` cannot be `PartialEq`, so [`AgentError::projection`] is the
+/// comparison. `error.rs` carries a test proving two equal projections agree
+/// on every observable predicate, which a hand-rolled `(discriminant, status,
+/// message)` tuple would not. It is written through `Debug` because the
+/// projection is a structural enum over `PartialEq` fields, so its debug form
+/// separates exactly what `==` does.
+///
+/// The rendered message rides along because the projection reads the message
+/// only through those predicates, and some behaviour lives nowhere else: a
+/// provider that substitutes a message for an error frame that carried none
+/// projects identically to one that does not.
 fn failure(e: &AgentError) -> Value {
     json!({ "error": format!("{:?}", e.projection()), "message": e.to_string() })
-}
-
-/// What a session's gauge learns from this response, which is the whole of
-/// what a `StreamResponse`'s usage does downstream.
-fn gauge_size(usage: &TokenUsage) -> u32 {
-    let mut gauge = ContextGauge::default();
-    gauge.record(usage.total_input());
-    gauge.size()
 }
 
 fn golden_path(provider: &str, case: &str) -> PathBuf {
@@ -236,25 +389,25 @@ fn pretty(value: &Value) -> String {
 /// the build.
 ///
 /// `serde_json::Map` is an `IndexMap` whenever anything in the build graph
-/// turns on `preserve_order` -- `agent-client-protocol-schema` does, so a
-/// workspace build has it and `-p maki-providers` does not -- and cargo
-/// unifies features across the graph rather than per crate. Key order would
-/// then be a property of the `-p` flags, both in the golden itself and inside
-/// the recorded body, which is a JSON document carried as a string. Sorting
-/// every object at every depth, and the body's after parsing it, leaves one
+/// turns on `preserve_order`. `agent-client-protocol-schema` does, so a
+/// workspace build has it and `-p maki-providers` does not, and cargo unifies
+/// features across the graph rather than per crate. Key order would then be a
+/// property of the `-p` flags, both in the golden itself and inside the
+/// recorded body, which is a JSON document carried as a string. Sorting every
+/// object at every depth, and the body's after parsing it, leaves one
 /// canonical form for both builds to agree on.
 fn canonical_observation(observed: &Value) -> Value {
     let mut canonical = sorted(observed);
     let requests = canonical
         .get_mut(REQUESTS_KEY)
         .and_then(Value::as_array_mut)
-        .expect(NOT_AN_OBJECT);
+        .expect(NO_REQUESTS);
     for request in requests {
         let Some(body) = request.get_mut(BODY_KEY) else {
             continue;
         };
-        // A fixture whose request body is not JSON (or is empty) keeps the raw
-        // string: there is no key order in it to leak.
+        // A body that is not JSON, or is empty, keeps the raw string: there is
+        // no key order in it to leak.
         if let Some(parsed) = body
             .as_str()
             .and_then(|raw| serde_json::from_str::<Value>(raw).ok())
@@ -282,7 +435,7 @@ fn sorted(value: &Value) -> Value {
 /// Compares one observation against the artifact on disk, or records it when
 /// `UPDATE_GOLDENS=1`. Both sides are canonicalised, so this asserts what the
 /// provider did and never which crates the test binary was linked against.
-pub(crate) fn assert_golden(provider: &str, fixture: &Fixture, observed: &Value) {
+fn assert_golden(provider: &str, fixture: &Fixture, observed: &Value) {
     let path = golden_path(provider, fixture.name);
     let observed = canonical_observation(observed);
     if std::env::var(UPDATE_ENV).is_ok_and(|value| value == UPDATE_ON) {
@@ -305,36 +458,5 @@ pub(crate) fn assert_golden(provider: &str, fixture: &Fixture, observed: &Value)
         path.display(),
         pretty(&expected),
         pretty(&observed)
-    );
-}
-
-/// The extra assertion the differential half is made of: that the
-/// implementation being ported *away from* observes the same exchange as the
-/// declaration-driven one.
-///
-/// Canonicalised, like [`assert_golden`]. It was not, once, on the grounds
-/// that both sides run in one process under one feature set and so key order
-/// is free to compare -- but free is not the same as meaningful. `serde_json`
-/// sorts its maps unless something in the build graph turns on
-/// `preserve_order`, so the raw comparison asserted nothing beyond this one
-/// under `-p maki-providers` and asserted field *position* under `--workspace`:
-/// a rule that only exists for some of the builds that run it is not one a port
-/// can be held to. What survives canonicalisation is every field name and every
-/// value at every depth, plus `content-length`, which is the whole of what a
-/// request says. The deepseek port writes `thinking` after the codec has
-/// already written `reasoning_effort`, where the bespoke impl wrote it before:
-/// two positions, one request.
-///
-/// Deleting this function once the bespoke impl is gone costs no coverage:
-/// every case is still asserted against its golden.
-pub(crate) fn assert_ported(fixture: &Fixture, declared: &Value, ported: &Value) {
-    let declared = canonical_observation(declared);
-    let ported = canonical_observation(ported);
-    assert!(
-        ported == declared,
-        "{} differs between the two implementations\n--- expected\n{}\n--- got\n{}",
-        fixture.name,
-        pretty(&declared),
-        pretty(&ported)
     );
 }

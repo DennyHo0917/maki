@@ -33,6 +33,14 @@ pub use providers::openai::auth as openai_auth;
 pub use providers::plugin;
 pub use providers::xai::auth as xai_auth;
 pub use providers::{KeyHeader, KeyPool, KeyRotation, ResolvedAuth};
+/// The golden replay harness and the recorded cases of every ported provider,
+/// published on the same terms as [`test_support`] and for the same reason:
+/// the authoring that ships is a Lua plugin, which only `maki-lua` can stage,
+/// and it has to answer to these goldens too.
+#[cfg(any(test, feature = "test-support"))]
+pub use providers::{
+    deepseek::fixtures as deepseek_fixtures, replay, synthetic::fixtures as synthetic_fixtures,
+};
 pub use tokens::{ContextGauge, estimate_message_tokens, estimate_prompt_tokens};
 pub use types::{
     ContentBlock, EMPTY_RESPONSE_MARKER, Effort, EffortDialect, IMAGE_EVICTED_NOTE,

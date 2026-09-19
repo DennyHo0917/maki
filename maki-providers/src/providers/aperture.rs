@@ -427,10 +427,8 @@ impl Provider for Aperture {
             let model_id = model_id.to_string();
             let ov = merged_override(&self.overrides, provider_id, &model_id);
             if let Some(spec) = routed_spec(provider_id, &ov)
-                && let Some(routed) = self.routed_provider(
-                    spec,
-                    routed_auth(&self.auth, &path_prefix(Some(spec), &ov)),
-                )
+                && let Some(routed) = self
+                    .routed_provider(spec, routed_auth(&self.auth, &path_prefix(Some(spec), &ov)))
             {
                 let full_id = std::mem::replace(&mut model.id, model_id);
                 routed.adjust_model(model);

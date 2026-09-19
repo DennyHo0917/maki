@@ -5,7 +5,9 @@ use std::sync::{Arc, LazyLock, Mutex, RwLock};
 
 use flume::Sender;
 use maki_config::host_allowed;
-use maki_config::providers::{ImplChoice, Protocol, ProviderDef, ProvidersConfig};
+use maki_config::providers::{
+    ImplChoice, Protocol, ProviderDef, ProvidersConfig, configured_base_url,
+};
 use maki_storage::StateDir;
 use maki_storage::auth::lock_credentials;
 use maki_storage::id::SessionRef;
@@ -23,7 +25,7 @@ use crate::types::{EffortDialect, ThinkingFields, dialect};
 use crate::{AgentError, Message, ProviderEvent, ProviderUsage, RequestOptions, StreamResponse};
 
 use super::codec::{self, BodyHook, CodecOptions};
-use super::{KeyHeader, KeyPool, KeyRotation, ResolvedAuth, Timeouts, synthetic};
+use super::{KeyHeader, KeyPool, KeyRotation, ResolvedAuth, Timeouts, deepseek, synthetic};
 
 const DEFAULT_MAX_OUTPUT_TOKENS: u32 = 16384;
 const DEFAULT_CONTEXT_WINDOW: u32 = 128_000;
@@ -37,9 +39,8 @@ const HTTPS_SCHEME: &str = "https";
 const HTTP_SCHEME: &str = "http";
 const LOCALHOST: &str = "localhost";
 
-/// One plugin-supplied callback. Generic in both directions so every hook on
-/// [`ProviderHooks`] is the same shape, and `Option::is_some` is the only
-/// presence question the registry ever asks.
+/// One plugin-supplied callback. Generic both ways so every hook on
+/// [`ProviderHooks`] has the same shape and presence is one `Option` check.
 pub trait Hook<In, Out>: Send + Sync {
     fn call(&self, input: In) -> BoxFuture<'_, Result<Out, AgentError>>;
 }
@@ -66,8 +67,8 @@ pub enum AuthPurpose {
 }
 
 /// The request as it goes on the wire, plus the two things a plugin branches
-/// on. `thinking` is rendered, not structured, because the hook is a wire-level
-/// escape hatch and not a second place to model effort.
+/// on. `thinking` is rendered text and not structure, because the hook is a
+/// wire-level escape hatch and not a second place to model effort.
 #[derive(Serialize)]
 pub struct BodyInput {
     pub body: Value,
@@ -97,14 +98,13 @@ impl PluginAuth {
     }
 }
 
-/// The only place an origin a plugin chose is admitted, whether it arrived with
-/// the registration or from an auth hook. Both paths end up holding the token
-/// maki sends, so both ask the same question of the same list.
+/// The only door an origin a plugin chose comes through, whether it arrived
+/// with the registration or from an auth hook. Both end up holding the token
+/// maki sends, so both answer to the same host list.
 ///
-/// Origin, not host: the scheme is half of what a declaration promises. A
-/// declared host reached over plaintext puts the token on the wire in the
-/// clear, so only `https` is admitted. `http` stays open for loopback, where a
-/// self-hosted provider has no wire to listen on.
+/// The scheme is half of the promise: a declared host reached over plaintext
+/// still puts the token on the wire in the clear. Only `https` passes, plus
+/// `http` on loopback, where a self-hosted provider has no wire to listen on.
 fn declared_base_url(
     slug: &str,
     base_url: Option<String>,
@@ -143,9 +143,8 @@ fn is_loopback(url: &Url) -> bool {
 }
 
 /// One declared model row. `Serialize` mirrors `Deserialize` field for field,
-/// defaults included, so a row that went through either survives a round trip
-/// and two decls of the same provider compare equal whichever way they were
-/// authored.
+/// defaults included, so a row survives a round trip and two spellings of the
+/// same provider compare equal whichever way they were authored.
 #[derive(Clone, PartialEq, Deserialize, Serialize)]
 pub struct PluginModel {
     /// Every id this row answers for. `prefixes[0]` is the canonical id,
@@ -182,17 +181,11 @@ impl PluginModel {
         self.prefixes.first().map(String::as_str)
     }
 
-    fn to_model(
-        &self,
-        slug: &str,
-        base: &'static ProviderSpec,
-        id: String,
-        tier: ModelTier,
-    ) -> Model {
+    fn to_model(&self, slug: &str, base: &'static ProviderSpec, id: String) -> Model {
         Model {
             id,
             provider: Arc::from(slug),
-            tier,
+            tier: self.tier,
             family: base.family,
             supports_tool_examples_override: self.supports_tool_examples,
             thinking_override: ThinkingSupport::from_flags(
@@ -211,11 +204,10 @@ impl PluginModel {
         }
     }
 
-    /// This row as the catalogue reports it. Every field the declaration
-    /// states is carried, `supports_*` included: they are `Option` on both
-    /// sides, so an unstated one stays unstated rather than becoming a
-    /// published negative. `provider_info` is a stash only the Rust provider
-    /// that filled it can read back, so a declared row never has one.
+    /// This row as the catalogue reports it. The `supports_*` flags are
+    /// `Option` on both sides, so an unstated one stays unstated rather than
+    /// becoming a published negative. `provider_info` is a stash only the Rust
+    /// provider that filled it reads back, so a declared row never has one.
     fn to_info(&self) -> ModelInfo {
         ModelInfo {
             id: self.canonical_id().unwrap_or_default().to_string(),
@@ -242,15 +234,14 @@ fn default_context_window() -> u32 {
     DEFAULT_CONTEXT_WINDOW
 }
 
-/// One provider, as data. Everything maki needs to build it except the
-/// callbacks, which is what lets two declarations of the same provider be
-/// compared and dumped: for a provider with no hooks, `PartialEq` over this is
-/// a complete equivalence proof between the Rust-authored and the Lua-authored
-/// spelling of it.
+/// One provider, as data: everything maki needs to build it except the
+/// callbacks. Keeping the data on its own is what lets two spellings of the
+/// same provider be compared and dumped, and for a provider with no hooks that
+/// comparison is the whole proof that the Rust and the Lua authoring agree.
 ///
 /// `PartialEq` and not `Eq` because a declared [`ModelPricing`] is four `f64`
-/// rates, which have no total equality. Comparing them bitwise is exactly the
-/// question being asked -- two decls state the same rate or they do not.
+/// rates. Comparing them bitwise is exactly the question being asked: two
+/// decls state the same rate or they do not.
 #[derive(Clone, PartialEq, Serialize)]
 pub struct ProviderDecl {
     pub slug: String,
@@ -261,26 +252,25 @@ pub struct ProviderDecl {
     pub base: Option<String>,
     /// The declaration's static origin, below the user's `<SLUG>_BASE_URL` and
     /// `providers.toml`. An origin a hook returns is a different thing and
-    /// outranks both; see [`CodecOptions::base_url`].
+    /// outranks both, see [`CodecOptions::base_url`].
     pub base_url: Option<String>,
     pub api_key_env: Option<String>,
     pub system_prefix: Option<String>,
-    /// `None` is `max_tokens`; see [`CodecOptions::max_tokens_field`].
+    /// `None` means `max_tokens`, see [`CodecOptions::max_tokens_field`].
     pub max_tokens_field: Option<String>,
-    /// `None` asks for streamed usage; see
+    /// `None` asks for streamed usage, see
     /// [`CodecOptions::include_stream_usage`].
     pub include_stream_usage: Option<bool>,
-    /// How this provider's API spells reasoning effort, when it has its own
-    /// word for it.
+    /// How this provider's API spells reasoning effort, when it has a word of
+    /// its own for it.
     #[serde(serialize_with = "serialize_dialect")]
     pub thinking_dialect: Option<&'static EffortDialect<'static>>,
     pub models: Vec<PluginModel>,
     pub net_hosts: Vec<String>,
 }
 
-/// Serialised as the dialect's name, so the table stays the one source of
-/// truth for what a dialect is and a decl carries the name once, in the
-/// dialect it already holds.
+/// Dumped as the dialect's name, so the table stays the one source of truth
+/// for what a dialect is and a decl never carries the name twice.
 fn serialize_dialect<S: Serializer>(
     thinking_dialect: &Option<&'static EffortDialect<'static>>,
     serializer: S,
@@ -292,20 +282,55 @@ fn serialize_dialect<S: Serializer>(
 
 /// A declaration plus the callbacks that go with it. The split is the point:
 /// the data half is comparable and dumpable, the behaviour half is neither.
+/// They still travel together, so nothing builds a provider from data that was
+/// never checked against its hooks.
 pub struct Registration {
     pub decl: ProviderDecl,
     pub hooks: ProviderHooks,
 }
 
-/// Which language a declaration was authored in, which is the only axis a
-/// provider varies on once it is data. Recorded rather than inferred: nothing
-/// about a registered entry says where it came from, and every log line about
-/// one should.
+/// Which language a declaration was authored in, the only axis a provider
+/// varies on once it is data. Recorded rather than inferred, because nothing
+/// else about an entry says where it came from and every log line about one
+/// should be able to say.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DeclSource {
     Rust,
     Lua,
+}
+
+/// Who stands behind a declaration. A different question from which language
+/// wrote it, and the only one that decides whether a slug maki already ships
+/// may be taken over.
+///
+/// Claiming a built-in slug inherits that row's `api_key_env`, so the key the
+/// user set for the built-in is resolved into the claimant's credentials and
+/// sent to the origin the claimant declared. Exactly right for the bundled
+/// plugin that *is* the provider, credential theft from anything else. A
+/// package asks for `net` and a list of hosts, and nothing in that grant says
+/// "and the built-in providers' keys".
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DeclAuthority {
+    /// maki's own: a Rust declaration, or a plugin compiled into the binary.
+    Bundled,
+    /// Anything that arrived after the build: a package, a local plugin
+    /// directory, `init.lua`.
+    ThirdParty,
+}
+
+/// Whether the declaration that just registered is the one serving its slug.
+///
+/// Answered rather than assumed, because losing is not failing: `impl` in
+/// `providers.toml` picks between two authors and the loser is still a
+/// well-formed declaration. A caller that grants credentials or egress off the
+/// back of a registration has to grant them to the winner only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Registered {
+    Serving,
+    /// Another author's declaration holds the slug, see [`wins`].
+    Shadowed,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -316,6 +341,10 @@ pub enum RegisterError {
     InvalidSlug(String),
     #[error("provider slug '{0}' is already defined in providers.toml")]
     ConfiguredSlug(String),
+    #[error(
+        "provider slug '{0}' belongs to a built-in provider and cannot be declared by a plugin maki does not ship"
+    )]
+    ReservedSlug(String),
     #[error("provider '{slug}': {message}")]
     Credentials { slug: String, message: String },
     #[error("provider '{0}' is already registered")]
@@ -350,8 +379,8 @@ pub enum RegisterError {
     },
 }
 
-/// Resolves the dialect a declaration names, for an authoring surface that
-/// carries names rather than consts.
+/// Looks a dialect up by name, for authoring surfaces that carry names rather
+/// than Rust consts.
 pub fn thinking_dialect(
     slug: &str,
     name: &str,
@@ -391,9 +420,9 @@ impl Target {
 
 /// Only the openai codecs thread a body hook through [`codec::build`].
 ///
-/// Written as an exhaustive match rather than a list of the ones that work, so
-/// a new codec breaks this line and someone has to answer for it. An option a
-/// codec cannot honour is a registration error, never a no-op.
+/// An exhaustive match rather than a list of the ones that work, so a new
+/// codec breaks this line and someone has to answer for it. An option a codec
+/// cannot honour is a registration error, never a no-op.
 fn honours_build_body(target: Target) -> bool {
     match target {
         Target::Codec(Protocol::Openai | Protocol::OpenaiResponses) => true,
@@ -403,8 +432,8 @@ fn honours_build_body(target: Target) -> bool {
 
 /// Google drops the system prefix and always has (see `super::google`), so a
 /// plugin that sets one against it is told instead of ignored. Asked of the
-/// spec behind the target rather than of the target, because `codec = "google"`
-/// and `base = "google"` reach the same constructor and must answer alike.
+/// spec behind the target, because `codec = "google"` and `base = "google"`
+/// reach the same constructor and must answer alike.
 fn honours_system_prefix(target: Target) -> bool {
     !target
         .spec()
@@ -421,16 +450,18 @@ fn is_valid_slug(s: &str) -> bool {
 struct PluginEntry {
     decl: ProviderDecl,
     /// The built-in spec row this decl claimed, `None` for a slug maki did not
-    /// already know. Everything a claim does not restate is read back off it
-    /// through [`PluginEntry::spec`] and [`PluginEntry::display_name`], which
-    /// is why inheritance needs no "am I a claim" branch anywhere else.
+    /// already know. What a claim leaves out is read back off the row by
+    /// [`PluginEntry::spec`] and [`PluginEntry::display_name`], so nobody else
+    /// has to ask whether an entry is a claim.
     claimed: Option<&'static ProviderSpec>,
     source: DeclSource,
+    /// The plugin that registered this, `None` for maki's own Rust decls.
+    owner: Option<Arc<str>>,
     target: Target,
     hooks: ProviderHooks,
     /// Shared with every other entry this slug ever had: an entry is replaced
     /// on reload, its credentials are not. Held here rather than looked up
-    /// beside the entry so "registered" and "has credentials" cannot come
+    /// beside the entry, so "registered" and "has credentials" cannot come
     /// apart at a call site.
     auth: Arc<AuthState>,
 }
@@ -446,62 +477,106 @@ static PROVIDERS: LazyLock<RwLock<Arc<Registry>>> = LazyLock::new(RwLock::defaul
 /// phases (tests, embedders) still registers.
 static STAGING: LazyLock<Mutex<Option<Registry>>> =
     LazyLock::new(|| Mutex::new(Some(Registry::new())));
-/// Append-only for the life of the process: see the note in [`register`].
+/// Append-only for the life of the process: see [`shared_auth`].
 static AUTH: LazyLock<RwLock<HashMap<Box<str>, Arc<AuthState>>>> = LazyLock::new(RwLock::default);
 
-/// Every declaration maki itself authors, staged by [`begin_load`] before a
+/// Every declaration maki itself authors, staged by [`begin_load`] before any
 /// plugin gets to speak. Written out rather than collected with `inventory`
 /// for the reason [`crate::spec::ProviderRegistry::builtins`] gives, and
 /// because one list read top to bottom is how anyone tells which providers are
-/// ported.
-///
-/// Each port appends its constructor here (`anthropic::decl`), and the list --
-/// with the seeding in [`begin_load`] and the precedence in [`wins`] -- goes
-/// away with the last provider that still needs it.
-const RUST_DECLS: &[fn() -> Registration] = &[|| Registration {
-    decl: synthetic::decl(),
-    hooks: ProviderHooks::default(),
-}];
+/// ported. Each port appends its constructor here, and this list, the seeding
+/// in [`begin_load`] and the precedence in [`wins`] all go away with the last
+/// provider that still needs them.
+const RUST_DECLS: &[fn() -> Registration] = &[
+    || Registration {
+        decl: synthetic::decl(),
+        hooks: ProviderHooks::default(),
+    },
+    || Registration {
+        decl: deepseek::decl(),
+        hooks: deepseek::hooks(),
+    },
+];
 
 /// Opens the registration window, at the top of every plugin load.
 ///
-/// Nothing published goes away here. A `/reload` builds a new plugin host, and
-/// an entry left behind by the old one holds hooks that answer on a channel
-/// nobody serves any more. Dropping them before the replacements exist would be
-/// worse: every reader in the process would answer "unknown provider" for as
-/// long as the load takes. The staged map replaces the published one in one
-/// step at [`commit_load`] instead.
+/// Nothing published goes away here. Dropping the old entries before the
+/// replacements exist would make every reader answer "unknown provider" for as
+/// long as the load takes, so [`commit_load`] swaps the whole map in one step
+/// instead.
 ///
-/// The Rust-authored decls are staged first, so every slug maki ships one for
-/// is already answered when the load starts: a Lua decl that never arrives, or
-/// arrives broken, leaves that one standing instead of leaving the slug with
-/// nothing.
+/// The Rust-authored decls are staged first, so a Lua decl that never arrives,
+/// or arrives broken, leaves the shipped one standing.
 pub fn begin_load() {
     *STAGING.lock().unwrap() = Some(Registry::new());
-    for declare in RUST_DECLS {
-        let reg = declare();
-        let slug = reg.decl.slug.clone();
-        if let Err(error) = register(reg, DeclSource::Rust) {
-            warn!(slug, %error, "built-in provider declaration was rejected");
-        }
+    RUST_DECLS.iter().for_each(|declare| stage_rust(declare()));
+}
+
+fn stage_rust(reg: Registration) {
+    let slug = reg.decl.slug.clone();
+    if let Err(error) = register(reg, DeclSource::Rust, DeclAuthority::Bundled) {
+        warn!(slug, %error, "built-in provider declaration was rejected");
     }
 }
 
 /// Publishes what this load registered. A load that registered nothing
 /// publishes nothing, which is how a `/reload` drops a plugin that was removed.
+///
+/// Credentials are re-pointed here and not at registration, so they only ever
+/// follow a declaration that is actually going to serve: one a failed plugin
+/// staged and [`discard`] took back never touched them.
 pub fn commit_load() {
     let Some(staged) = STAGING.lock().unwrap().take() else {
         return;
     };
+    for entry in staged.values() {
+        let slug = &entry.decl.slug;
+        let api_key_env = api_key_env(&entry.decl, entry.claimed);
+        if let Err(error) = entry
+            .auth
+            .redeclare(slug, api_key_env, &entry.decl.net_hosts)
+        {
+            warn!(slug, %error, "provider credentials were not re-declared");
+        }
+    }
     *PROVIDERS.write().unwrap() = Arc::new(staged);
+}
+
+/// Takes back everything `plugin` staged in the load in progress, for a plugin
+/// whose load failed after it registered. Whatever it displaced is staged
+/// again, so the slug ends up where it would be had the plugin never loaded.
+pub fn discard(plugin: &str) {
+    let dropped: Vec<Box<str>> = {
+        let mut staging = STAGING.lock().unwrap();
+        let Some(staged) = staging.as_mut() else {
+            return;
+        };
+        let dropped: Vec<Box<str>> = staged
+            .iter()
+            .filter(|(_, entry)| entry.owner.as_deref() == Some(plugin))
+            .map(|(slug, _)| slug.clone())
+            .collect();
+        for slug in &dropped {
+            staged.remove(slug);
+        }
+        dropped
+    };
+    if !dropped.is_empty() {
+        debug!(plugin, slugs = ?dropped, "discarded the declarations of a failed plugin load");
+    }
+    RUST_DECLS
+        .iter()
+        .map(|declare| declare())
+        .filter(|reg| dropped.iter().any(|slug| **slug == reg.decl.slug))
+        .for_each(stage_rust);
 }
 
 /// Which declaration serves a slug both a Rust and a Lua author declared:
 /// `true` when `challenger` takes the slug off `incumbent`.
 ///
-/// The only axis is who wrote the declaration -- both drive the same
-/// [`codec::build`] call -- so Lua wins by default and the field exercises the
-/// path the Lua authoring surface uses. `impl = "rust"` in `providers.toml`
+/// The only axis is who wrote the declaration, since both drive the same
+/// [`codec::build`] call. Lua wins by default, which keeps everyday use on the
+/// path plugin authors write against, and `impl = "rust"` in `providers.toml`
 /// pins the shipped one for a user the Lua decl misbehaves for.
 ///
 /// Two decls from the *same* source never reach here: that is
@@ -514,9 +589,9 @@ fn wins(incumbent: DeclSource, challenger: DeclSource, configured: Option<ImplCh
     challenger == preferred && incumbent != preferred
 }
 
-/// Who holds this slug in the load in progress, asked of the staged map rather
-/// than of what is published: a reload re-registers every slug it registered
-/// last time, and [`begin_load`] has already staged the Rust-authored decls.
+/// Who holds this slug in the load in progress. Asked of the staged map and
+/// not of what is published, because a reload re-registers every slug it
+/// registered last time and [`begin_load`] has already staged the Rust decls.
 fn staged_source(slug: &str) -> Result<Option<DeclSource>, RegisterError> {
     let staging = STAGING.lock().unwrap();
     let staged = staging
@@ -527,31 +602,58 @@ fn staged_source(slug: &str) -> Result<Option<DeclSource>, RegisterError> {
 
 /// Registers a declaration, or leaves the slug to the one that beat it.
 ///
-/// A declaration rejected while another source's is standing costs a warning
-/// and not a provider: the incumbent keeps serving the slug. That is a safe
-/// fallback only because both declarations drive the same code path -- the
-/// choice is of author, never of implementation -- and it is a loud one
-/// because a silent swap leaves "why is my provider behaving oddly" with
-/// nothing to go on. The error still goes back to the caller, so the plugin
-/// that failed is still reported as failed.
-pub fn register(reg: Registration, source: DeclSource) -> Result<(), RegisterError> {
+/// A declaration rejected while another author's is standing costs a warning
+/// and not a provider: the incumbent keeps serving the slug. Safe only because
+/// both declarations drive the same code path, and loud because a silent swap
+/// leaves "why is my provider behaving oddly" with nothing to go on. The error
+/// still goes back to the caller, so a plugin that failed is reported failed.
+pub fn register(
+    reg: Registration,
+    source: DeclSource,
+    authority: DeclAuthority,
+) -> Result<Registered, RegisterError> {
+    register_owned(reg, source, authority, None)
+}
+
+/// [`register`] for a Lua plugin, remembered as `plugin`'s so a load of it
+/// that fails later can be taken back with [`discard`].
+pub fn register_plugin(
+    plugin: Arc<str>,
+    reg: Registration,
+    authority: DeclAuthority,
+) -> Result<Registered, RegisterError> {
+    register_owned(reg, DeclSource::Lua, authority, Some(plugin))
+}
+
+fn register_owned(
+    reg: Registration,
+    source: DeclSource,
+    authority: DeclAuthority,
+    owner: Option<Arc<str>>,
+) -> Result<Registered, RegisterError> {
     let slug = reg.decl.slug.clone();
-    let result = register_decl(reg, source);
+    let result = register_decl(reg, source, authority, owner);
     if let Err(error) = &result
-        && let Some(standing) = staged_source(&slug).ok().flatten().filter(|s| *s != source)
+        && let Ok(Some(standing)) = staged_source(&slug)
+        && standing != source
     {
         warn!(
             slug,
             ?source,
             ?standing,
             %error,
-            "declaration rejected; the standing declaration keeps this slug"
+            "declaration rejected, the standing declaration keeps this slug"
         );
     }
     result
 }
 
-fn register_decl(reg: Registration, source: DeclSource) -> Result<(), RegisterError> {
+fn register_decl(
+    reg: Registration,
+    source: DeclSource,
+    authority: DeclAuthority,
+    owner: Option<Arc<str>>,
+) -> Result<Registered, RegisterError> {
     let Registration { decl, hooks } = reg;
     let slug = decl.slug.clone();
     if !is_valid_slug(&slug) {
@@ -576,20 +678,29 @@ fn register_decl(reg: Registration, source: DeclSource) -> Result<(), RegisterEr
                 ?configured,
                 "kept the standing provider declaration"
             );
-            return Ok(());
+            return Ok(Registered::Shadowed);
         }
     }
-    // A built-in slug is claimable rather than reserved: a declaration is how
-    // a built-in provider is written now, and the spec row it claims stays the
-    // single source of truth for everything [`inherited`] lists. A slug maki
-    // has no row for is still nobody's to claim -- there would be nothing to
-    // inherit and the name would collide with a future built-in.
-    let claimed = ProviderRegistry::get(&slug);
+    // maki's own declarations may claim a built-in slug, because a declaration
+    // is how a built-in provider is written now and the spec row it claims
+    // stays the single source of truth for everything [`inherited`] lists.
+    //
+    // For anyone else the slug stays reserved, and the rejection is here
+    // rather than a silent demotion to a non-claim: a third party that took
+    // `anthropic` without inheriting the row would still have taken
+    // `anthropic`, which is the part that matters. See [`DeclAuthority`]. A
+    // slug maki has no row for is nobody's to claim either, there would be
+    // nothing to inherit and the name would collide with a future built-in.
+    let claimed = match (ProviderRegistry::get(&slug), authority) {
+        (Some(spec), DeclAuthority::Bundled) => Some(spec),
+        (Some(_), DeclAuthority::ThirdParty) => return Err(RegisterError::ReservedSlug(slug)),
+        (None, _) => None,
+    };
     // Only a slug maki does not already own can be lost to `providers.toml`.
-    // An entry under a built-in slug has never defined a provider -- the
-    // built-in keeps the slug and the entry overlays what
+    // An entry under a built-in slug has never defined a provider: the built-in
+    // keeps the slug and the entry overlays what
     // [`maki_config::providers::ignored_builtin_fields`] does not name, which
-    // is how `[synthetic] base_url` points the shipped provider at a gateway.
+    // is how `[deepseek] base_url` points the shipped provider at a gateway.
     // Rejecting the claim over one would delete the provider the overlay was
     // written for, and would delete it for the Rust-authored declaration too.
     if claimed.is_none() && config_entry.is_some_and(defines_provider) {
@@ -604,52 +715,23 @@ fn register_decl(reg: Registration, source: DeclSource) -> Result<(), RegisterEr
     // one thing checked at registration and read back at `create`.
     declared_base_url(&slug, decl.base_url.clone(), &decl.net_hosts)
         .map_err(RegisterError::UndeclaredBaseUrl)?;
-
-    let target = match (decl.codec, &decl.base) {
-        (Some(protocol), None) => Target::Codec(protocol),
-        (None, Some(base)) => Target::Base(
-            ProviderRegistry::get(base)
-                .filter(|spec| spec.is_native())
-                .ok_or_else(|| RegisterError::UnknownBase {
-                    slug: slug.clone(),
-                    base: base.clone(),
-                })?,
-        ),
-        _ => return Err(RegisterError::CodecOrBase(slug)),
-    };
-    let unsupported = |option| RegisterError::Unsupported {
+    let target = target_of(&decl, &hooks)?;
+    // Checked now and applied at [`commit_load`], so a bad `[<slug>.headers]`
+    // still fails the plugin that registered the slug.
+    ResolvedAuth::new(&slug, Vec::new()).map_err(|e| RegisterError::Credentials {
         slug: slug.clone(),
-        option,
-        target: target.describe(),
-    };
-    if hooks.build_body.is_some() && !honours_build_body(target) {
-        return Err(unsupported(BUILD_BODY_OPTION));
-    }
-    if decl.system_prefix.is_some() && !honours_system_prefix(target) {
-        return Err(unsupported(SYSTEM_PREFIX_OPTION));
-    }
+        message: e.to_string(),
+    })?;
 
-    let api_key_env = api_key_env(&decl, claimed);
     let mut staging = STAGING.lock().unwrap();
     let Some(staged) = staging.as_mut() else {
         return Err(RegisterError::Closed(slug));
     };
-    // Credentials survive a reload because of *which map they live in*: a
-    // get-or-insert by slug, so a reload cannot mint a second `RefreshGate` for
-    // a slug whose token is in flight. What the new registration *declares* is
-    // handed to the state either way, which is what keeps an edited
-    // `api_key_env` from being silently ignored until the next restart.
-    let fresh = Arc::new(AuthState::new(&slug, &decl.net_hosts)?);
-    let auth = Arc::clone(
-        AUTH.write()
-            .unwrap()
-            .entry(slug.as_str().into())
-            .or_insert(fresh),
-    );
-    auth.redeclare(&slug, api_key_env, &decl.net_hosts)?;
+    let auth = shared_auth(&slug)?;
     debug!(
         slug,
         ?source,
+        ?authority,
         claims_builtin = claimed.is_some(),
         codec = ?decl.codec,
         base = decl.base.as_deref(),
@@ -663,17 +745,59 @@ fn register_decl(reg: Registration, source: DeclSource) -> Result<(), RegisterEr
             decl,
             claimed,
             source,
+            owner,
             target,
             hooks,
             auth,
         }),
     );
-    Ok(())
+    Ok(Registered::Serving)
 }
 
-/// The env var this declaration's key comes out of: its own, or the claimed
-/// row's. Empty means the provider has no key env at all (Ollama's host,
-/// Aperture's gateway), which is the same as declaring none.
+/// What this declaration builds its requests with, once every option it stated
+/// has been checked against what that target can honour. An option the target
+/// would quietly drop is a rejection, for the reason [`honours_build_body`]
+/// gives.
+fn target_of(decl: &ProviderDecl, hooks: &ProviderHooks) -> Result<Target, RegisterError> {
+    let target = match (decl.codec, &decl.base) {
+        (Some(protocol), None) => Target::Codec(protocol),
+        (None, Some(base)) => Target::Base(
+            ProviderRegistry::get(base)
+                .filter(|spec| spec.is_native())
+                .ok_or_else(|| RegisterError::UnknownBase {
+                    slug: decl.slug.clone(),
+                    base: base.clone(),
+                })?,
+        ),
+        _ => return Err(RegisterError::CodecOrBase(decl.slug.clone())),
+    };
+    let unsupported = |option| RegisterError::Unsupported {
+        slug: decl.slug.clone(),
+        option,
+        target: target.describe(),
+    };
+    if hooks.build_body.is_some() && !honours_build_body(target) {
+        return Err(unsupported(BUILD_BODY_OPTION));
+    }
+    if decl.system_prefix.is_some() && !honours_system_prefix(target) {
+        return Err(unsupported(SYSTEM_PREFIX_OPTION));
+    }
+    Ok(target)
+}
+
+/// One cell of credentials per slug, for the life of the process. Reusing it
+/// is what carries a token across a reload, and what stops a reload from
+/// minting a second [`RefreshGate`] for a slug whose token is in flight.
+fn shared_auth(slug: &str) -> Result<Arc<AuthState>, RegisterError> {
+    let mut states = AUTH.write().unwrap();
+    if let Some(state) = states.get(slug) {
+        return Ok(Arc::clone(state));
+    }
+    let state = Arc::new(AuthState::new(slug)?);
+    states.insert(slug.into(), Arc::clone(&state));
+    Ok(state)
+}
+
 /// Whether a `providers.toml` entry defines a provider of its own, as opposed
 /// to only naming which of two declarations serves the slug. An `impl` line is
 /// there to choose between them, so counting it as a definition would reject
@@ -681,8 +805,7 @@ fn register_decl(reg: Registration, source: DeclSource) -> Result<(), RegisterEr
 ///
 /// Asked of the serialised form rather than field by field: every field of
 /// [`ProviderDef`] is skipped when unset, so one added later counts without
-/// being listed here, and anything that does not serialise to an object counts
-/// as a definition.
+/// being listed here.
 fn defines_provider(def: &ProviderDef) -> bool {
     let Ok(Value::Object(fields)) = serde_json::to_value(def) else {
         return true;
@@ -690,6 +813,9 @@ fn defines_provider(def: &ProviderDef) -> bool {
     fields.keys().any(|field| field != IMPL_FIELD)
 }
 
+/// The env var this declaration's key comes out of: its own, or the claimed
+/// row's. Empty means the provider has no key env at all (Ollama's host,
+/// Aperture's gateway), which is the same as declaring none.
 fn api_key_env(decl: &ProviderDecl, claimed: Option<&'static ProviderSpec>) -> Option<String> {
     decl.api_key_env
         .as_deref()
@@ -714,22 +840,18 @@ fn inherited(
             None => Err(RegisterError::NoDisplayName(decl.slug.clone())),
         };
     }
-    let restated = |field| RegisterError::Restated {
-        slug: decl.slug.clone(),
-        field,
-    };
-    if decl.display_name.is_some() {
-        return Err(restated(DISPLAY_NAME_FIELD));
+    let restated = [
+        (DISPLAY_NAME_FIELD, decl.display_name.is_some()),
+        (API_KEY_ENV_FIELD, decl.api_key_env.is_some()),
+        (MODELS_FIELD, !decl.models.is_empty()),
+    ];
+    match restated.into_iter().find(|(_, stated)| *stated) {
+        Some((field, _)) => Err(RegisterError::Restated {
+            slug: decl.slug.clone(),
+            field,
+        }),
+        None => Ok(()),
     }
-    if decl.api_key_env.is_some() {
-        return Err(restated(API_KEY_ENV_FIELD));
-    }
-    // The curated table is the other half of the spec row's checklist, and a
-    // claim reads it through [`PluginEntry::spec`].
-    if !decl.models.is_empty() {
-        return Err(restated(MODELS_FIELD));
-    }
-    Ok(())
 }
 
 fn entries() -> Arc<Registry> {
@@ -759,8 +881,8 @@ enum DeclaredKeys {
         pool: KeyPool,
     },
     /// [`KeyPool::resolve`] failed. The message is kept rather than the error
-    /// because [`AgentError`] is not `Clone` and `create` has to answer with
-    /// it verbatim, every time, so the picker hides the provider instead of
+    /// because [`AgentError`] is not `Clone`, and `create` has to answer with
+    /// it verbatim every time so the picker hides the provider instead of
     /// listing one that cannot serve a request.
     Missing {
         env_var: String,
@@ -792,6 +914,36 @@ impl DeclaredKeys {
         }
     }
 
+    /// Resolves `env_var` afresh and adopts the answer only if it says
+    /// something new: another variable, other keys, or a key appearing or
+    /// going. The same keys keep the pool they had, so re-reading never walks a
+    /// rotating pool back to its first key. Answers whether anything moved.
+    fn refresh(&mut self, slug: &str, env_var: Option<String>) -> bool {
+        let fresh = Self::resolve(slug, env_var);
+        let unchanged = match (&*self, &fresh) {
+            (Self::Hooked, Self::Hooked) => true,
+            (
+                Self::Resolved { env_var, pool },
+                Self::Resolved {
+                    env_var: read,
+                    pool: read_pool,
+                },
+            ) => env_var == read && pool.same_keys(read_pool),
+            (
+                Self::Missing { env_var, message },
+                Self::Missing {
+                    env_var: read,
+                    message: read_message,
+                },
+            ) => env_var == read && message == read_message,
+            _ => false,
+        };
+        if !unchanged {
+            *self = fresh;
+        }
+        !unchanged
+    }
+
     /// The credentials a provider starts with, before any hook has run.
     fn initial_auth(&self, slug: &str) -> Result<ResolvedAuth, RegisterError> {
         let auth = match self {
@@ -808,9 +960,9 @@ impl DeclaredKeys {
 }
 
 /// Auth for one slug, kept in its own map so a reload cannot drop a token or a
-/// refresh in flight. One cell per slug for the life of the process: the codec
-/// reads it per request, so whatever the hook last wrote is what goes on the
-/// wire, without anything being rebuilt or copied back.
+/// refresh in flight. The codec reads this cell per request, so whatever the
+/// hook last wrote is what goes on the wire, with nothing rebuilt or copied
+/// back.
 struct AuthState {
     current: Arc<Mutex<ResolvedAuth>>,
     /// The latest registration's egress list, not the one the entry a caller
@@ -823,13 +975,13 @@ struct AuthState {
 }
 
 impl AuthState {
-    /// Starts with no credentials at all: the first [`Self::redeclare`] runs
-    /// before anything can read this, and it is the one place a declaration
-    /// becomes credentials.
-    fn new(slug: &str, hosts: &[String]) -> Result<Self, RegisterError> {
+    /// Starts with no credentials and no declared hosts. [`Self::redeclare`]
+    /// runs before anything can read this, so starting empty fails closed if
+    /// it ever did not.
+    fn new(slug: &str) -> Result<Self, RegisterError> {
         Ok(Self {
             current: Arc::new(Mutex::new(DeclaredKeys::Hooked.initial_auth(slug)?)),
-            hosts: Mutex::new(hosts.into()),
+            hosts: Mutex::default(),
             keys: Mutex::new(DeclaredKeys::Hooked),
             gate: RefreshGate::default(),
         })
@@ -842,21 +994,19 @@ impl AuthState {
     /// The pool `create` hands the provider for rotation, or the error the
     /// declared env var resolved to.
     ///
-    /// Retried here rather than only at registration, because a built-in is
-    /// constructed once per `create` and so picks up a key that appeared since
-    /// -- a `maki auth login` in this very process -- without waiting for a
-    /// reload.
+    /// Re-read on every call, the way a built-in rebuilt per `create` re-reads
+    /// its key: one that appeared or was replaced since, say by a `maki auth
+    /// login` after the old key was revoked, is what the next provider sends.
     fn declared_pool(&self, slug: &str) -> Result<Option<KeyPool>, AgentError> {
         let mut keys = self.keys.lock().unwrap();
-        if let DeclaredKeys::Missing { env_var, .. } = &*keys {
-            *keys = DeclaredKeys::resolve(slug, Some(env_var.clone()));
-            // Only over credentials nothing has minted: a token a hook
-            // produced is newer than anything an env var can offer.
-            if !self.gate.ran()
-                && let Ok(declared) = keys.initial_auth(slug)
-            {
-                *self.current.lock().unwrap() = declared;
-            }
+        let env_var = keys.env_var().map(str::to_owned);
+        // Only over credentials nothing has minted: a token a hook produced is
+        // newer than anything an env var can offer.
+        if keys.refresh(slug, env_var)
+            && !self.gate.ran()
+            && let Ok(declared) = keys.initial_auth(slug)
+        {
+            *self.current.lock().unwrap() = declared;
         }
         match &*keys {
             DeclaredKeys::Hooked => Ok(None),
@@ -872,12 +1022,11 @@ impl AuthState {
 
     /// Re-points one slug's credentials at what the newest registration says.
     ///
-    /// Three things change on a reload and none may be ignored: the declared
-    /// hosts, which are what every later hook answer is vetted against, the
-    /// declared key env var, and the static credentials, which are the only
-    /// ones a plugin without an auth hook ever has. A token a hook already
-    /// minted stays, unless the new declaration stopped covering the origin it
-    /// is pointed at.
+    /// Three things move on a reload and none may be ignored: the declared
+    /// hosts, which every later hook answer is vetted against, the declared key
+    /// env var, and the static credentials, which are the only ones a plugin
+    /// without an auth hook ever has. A token a hook already minted stays,
+    /// unless the new declaration stopped covering the origin it points at.
     fn redeclare(
         &self,
         slug: &str,
@@ -886,12 +1035,7 @@ impl AuthState {
     ) -> Result<(), RegisterError> {
         *self.hosts.lock().unwrap() = hosts.into();
         let mut keys = self.keys.lock().unwrap();
-        // Re-resolved only when the declaration moved: resolving reads the
-        // credential file, and a reload that changed nothing must not walk a
-        // rotating pool back to its first key.
-        if keys.env_var() != api_key_env.as_deref() {
-            *keys = DeclaredKeys::resolve(slug, api_key_env);
-        }
+        keys.refresh(slug, api_key_env);
         let declared = keys.initial_auth(slug)?;
         let mut current = self.current.lock().unwrap();
         let undeclared = declared_base_url(slug, current.base_url.clone(), hosts).is_err();
@@ -900,14 +1044,55 @@ impl AuthState {
         }
         Ok(())
     }
+
+    /// [`Self::mint`] under the cross-process lock: serialised against other
+    /// maki processes on the same credentials, and re-entrant in this one so
+    /// the hook can store what it minted.
+    async fn locked_mint(
+        &self,
+        slug: &str,
+        hook: &dyn Hook<AuthPurpose, PluginAuth>,
+        purpose: AuthPurpose,
+    ) -> Result<(), AgentError> {
+        let owned = slug.to_owned();
+        let _lock = smol::unblock(move || {
+            StateDir::resolve()
+                .ok()
+                .map(|dir| lock_credentials(&dir, &owned))
+        })
+        .await;
+        self.mint(slug, hook, purpose).await
+    }
+
+    /// Runs the auth hook and makes what it answered the credentials every
+    /// request to the slug carries.
+    async fn mint(
+        &self,
+        slug: &str,
+        hook: &dyn Hook<AuthPurpose, PluginAuth>,
+        purpose: AuthPurpose,
+    ) -> Result<(), AgentError> {
+        let mut fresh = hook
+            .call(purpose)
+            .await?
+            .into_resolved(slug, &self.hosts())?;
+        let mut current = self.current.lock().unwrap();
+        // A hook that omits base_url keeps the resolved one. Falling back to
+        // the provider's default origin would silently repoint the token.
+        if fresh.base_url.is_none() {
+            fresh.base_url = current.base_url.take();
+        }
+        *current = fresh;
+        Ok(())
+    }
 }
 
 impl PluginEntry {
     /// The spec row this entry answers inherited questions from: the built-in
-    /// it claimed, else the native spec behind its target (model family,
-    /// fallbacks, and the curated table a declaration that has none borrows).
-    /// The one place a claim's inheritance lives, so no caller asks whether it
-    /// is one.
+    /// it claimed, else the native spec behind its target. Model family,
+    /// fallbacks and the curated table a declaration with none of its own
+    /// borrows all come from here, so no caller has to ask what kind of entry
+    /// it is holding.
     fn spec(&self) -> Option<&'static ProviderSpec> {
         self.claimed.or_else(|| self.target.spec())
     }
@@ -917,8 +1102,8 @@ impl PluginEntry {
             .display_name
             .as_deref()
             .or(self.claimed.map(|spec| spec.display_name))
-            // Registration refuses a declaration with neither, so this arm is
-            // for the type and not for a real entry.
+            // Registration refuses a declaration with neither, so a real entry
+            // never reaches this arm.
             .unwrap_or(&self.decl.slug)
     }
 
@@ -934,58 +1119,47 @@ impl PluginEntry {
     /// The only place the auth hook is called. A plugin without one keeps the
     /// credentials its registration declared.
     ///
-    /// Answers whether credentials were actually minted, which is not the same
-    /// question as whether the call failed: a declaration with no auth hook
-    /// succeeds here having changed nothing, and a caller that reads that as a
-    /// refresh retries with the credentials it already had.
+    /// Answers whether credentials were actually minted, which is a different
+    /// question from whether the call failed: with no auth hook this succeeds
+    /// having changed nothing, and a caller that replayed a request on that
+    /// would only re-send the credentials it already had.
     ///
-    /// Callable from the plugin host's own thread: the hook goes to the host's
-    /// priority lane and the dispatch loop serves it while this future is
-    /// parked, which is how a subagent driven from Lua refreshes a token. What
-    /// may not reach here is a *blocking* caller, and that is held by
-    /// construction instead of by a check: every path in is `async`, and
-    /// `create` builds a provider without running a hook at all.
+    /// Callable from the plugin host's own thread, because the hook goes to the
+    /// host's priority lane and the dispatch loop serves it while this future
+    /// is parked. What may not reach here is a *blocking* caller, and that is
+    /// held by construction rather than by a check: every path in is `async`,
+    /// and `create` builds a provider without running a hook at all.
     async fn run_auth(&self, purpose: AuthPurpose) -> Result<bool, AgentError> {
-        let Some(hook) = &self.hooks.auth else {
+        let Some(hook) = self.hooks.auth.clone() else {
             return Ok(false);
         };
-        // One question, asked once, because both answers follow from it: a
-        // reload re-reads what a login wrote, so it spends no token. It waits
-        // for neither the gate nor the cross-process lock, and it runs under
-        // `block_on` on the ui thread, where either wait would freeze the ui.
-        let spends_a_token = !matches!(purpose, AuthPurpose::Reload);
-        let work = async {
-            // Serialised against other maki processes on the same credentials,
-            // and re-entrant in this one so the hook can store what it minted.
-            let _lock = if spends_a_token {
-                let slug = self.decl.slug.clone();
-                smol::unblock(move || {
-                    StateDir::resolve()
-                        .ok()
-                        .map(|dir| lock_credentials(&dir, &slug))
-                })
-                .await
-            } else {
-                None
-            };
-            let mut fresh = hook
-                .call(purpose)
-                .await?
-                .into_resolved(&self.decl.slug, &self.auth.hosts())?;
-            let mut guard = self.auth.current.lock().unwrap();
-            // A hook that omits base_url keeps the resolved one; falling back
-            // to the provider's default origin would silently repoint the token.
-            if fresh.base_url.is_none() {
-                fresh.base_url = guard.base_url.take();
-            }
-            *guard = fresh;
-            Ok(())
-        };
-        if spends_a_token {
-            self.auth.gate.single_flight(work).await?;
-        } else {
-            work.await?;
+        let slug = self.decl.slug.clone();
+        // A reload re-reads what a login wrote, so it spends no token. It
+        // waits for neither the gate nor the cross-process lock, and it runs
+        // under `block_on` on the ui thread, where either wait would freeze the
+        // ui.
+        if matches!(purpose, AuthPurpose::Reload) {
+            self.auth.mint(&slug, hook.as_ref(), purpose).await?;
+            return Ok(true);
         }
+        // Everything else spends a single-use token, so it runs to completion
+        // on its own task. A caller that goes away mid-flight, an Esc or a turn
+        // that timed out, must neither release the gate and the lock while the
+        // hook still holds the token nor drop what the hook minted with it.
+        let auth = Arc::clone(&self.auth);
+        let (done, outcome) = flume::bounded(1);
+        smol::spawn(async move {
+            let minted = auth
+                .gate
+                .single_flight(auth.locked_mint(&slug, hook.as_ref(), purpose))
+                .await;
+            let _ = done.send(minted);
+        })
+        .detach();
+        outcome
+            .recv_async()
+            .await
+            .map_err(|_| AgentError::Channel)??;
         Ok(true)
     }
 }
@@ -1097,9 +1271,9 @@ impl PluginProvider {
         if let Some(hook) = &self.entry.hooks.list_models {
             return hook.call(()).await;
         }
-        // A claim never declares a table (it inherits the curated one), and
-        // the inner provider it falls through to is built from the very codec
-        // the built-in used, so asking it is asking the built-in.
+        // A declaration with no table of its own, a claim included, falls
+        // through to the inner provider, which is built from the very codec
+        // the built-in uses. So asking it is asking the built-in.
         if self.entry.decl.models.is_empty() {
             return self.inner.list_models().await;
         }
@@ -1163,11 +1337,10 @@ impl Provider for PluginProvider {
                 match result {
                     // The plugin mints credentials without the user, so an
                     // expired token costs one silent refresh instead of a
-                    // re-login prompt. Only a refresh that actually minted
-                    // something earns the replay: a declaration whose key comes
-                    // from an `api_key_env` has no hook to run, so retrying
-                    // would re-send the very key the server just rejected and
-                    // hand the caller the second 401 instead of the first.
+                    // re-login prompt. Only a refresh that minted something
+                    // earns the replay: a declaration keyed off an
+                    // `api_key_env` has no hook to run, so a second try would
+                    // re-send the key the server just rejected.
                     Err(e) if e.is_auth_error() && !forwarded => {
                         debug!(error = %e, "auth error, refreshing plugin-backed credentials");
                         match self.entry.run_auth(AuthPurpose::Refresh).await {
@@ -1239,7 +1412,7 @@ impl Provider for PluginProvider {
 /// A declaration that names an `api_key_env` and resolved no key fails here
 /// rather than at the first request, which is what makes `provider_available`
 /// tell the truth about it and the picker hide it. A declaration without one
-/// gets its credentials from a hook and so cannot know yet; it stays lazy. The
+/// gets its credentials from a hook and cannot know yet, so it stays lazy. The
 /// rule keys off the declared field, never off who wrote the declaration.
 pub fn create(slug: &str, timeouts: Timeouts) -> Result<Box<dyn Provider>, AgentError> {
     let entry = entry(slug).ok_or_else(|| unknown(slug))?;
@@ -1267,10 +1440,9 @@ pub fn create(slug: &str, timeouts: Timeouts) -> Result<Box<dyn Provider>, Agent
 ///
 /// The declared origin lands in `base_url` and not in the auth cell on
 /// purpose: `auth.base_url` outranks the user's `<SLUG>_BASE_URL`, which a
-/// static declaration must not. Provenance is carried by the two fields
-/// themselves and needs no newtype and no carve-out: `resolved_base_url` is
-/// read off the user's env and `providers.toml` inside the compat layer, where
-/// nothing here can write it, and `auth.base_url` is only ever written through
+/// static declaration must not. `base_url` is read back against env and
+/// `providers.toml` inside the compat layer, where nothing here can write it,
+/// and `auth.base_url` is only ever written through
 /// [`PluginAuth::into_resolved`], the one door that vets an origin against the
 /// declared `net_hosts`.
 fn codec_options(entry: &PluginEntry, protocol: Protocol) -> CodecOptions {
@@ -1306,14 +1478,39 @@ pub fn resolved_auth(slug: &str) -> Option<ResolvedAuth> {
     Some(entry(slug)?.auth.current.lock().unwrap().clone())
 }
 
+/// The origin a request to `slug` would reach right now, resolved the way a
+/// codec resolves it per request: an auth-supplied origin, then the user's
+/// `<SLUG>_BASE_URL` or `providers.toml`, then the declared default.
+///
+/// A hook reaching an endpoint off the codec's request path has to resolve the
+/// same origin the codec would, or a user who points the slug at a gateway has
+/// that one call go somewhere else.
+pub fn effective_base_url(slug: &str) -> Option<String> {
+    let entry = entry(slug)?;
+    if let Some(explicit) = entry.auth.current.lock().unwrap().base_url.clone() {
+        return Some(explicit);
+    }
+    let providers = ProvidersConfig::load();
+    configured_base_url(slug, providers.get(slug)).or_else(|| entry.decl.base_url.clone())
+}
+
+/// The host of [`effective_base_url`], for a caller deciding whether an
+/// outbound request is one this provider is already making. Every origin that
+/// can win there was either vetted at registration (the declaration's own, a
+/// hook's) or stated by the user (`<SLUG>_BASE_URL`, `providers.toml`).
+pub fn effective_host(slug: &str) -> Option<String> {
+    let base_url = effective_base_url(slug)?;
+    Some(Url::parse(&base_url).ok()?.host_str()?.to_owned())
+}
+
 pub fn base_for_slug(slug: &str) -> Option<&'static ProviderSpec> {
     entry(slug)?.spec()
 }
 
 /// The declaration maki itself authors for `slug`, which is not always the one
-/// serving it: a Lua author's decl for the same slug outranks it unless
-/// `impl = "rust"` says otherwise. Read straight off [`RUST_DECLS`], so it
-/// answers whether or not a load has happened.
+/// serving it: a Lua decl for the same slug outranks it unless `impl = "rust"`
+/// says otherwise. Read straight off [`RUST_DECLS`], so it answers before any
+/// load has happened.
 pub fn rust_decl(slug: &str) -> Option<ProviderDecl> {
     RUST_DECLS
         .iter()
@@ -1352,42 +1549,51 @@ pub fn build_with_auth(
 pub fn lookup_model(slug: &str, model_id: &str) -> Option<Model> {
     let entry = entry(slug)?;
     let model = longest_prefix_match(&entry.decl.models, model_id)?;
-    Some(model.to_model(slug, entry.spec()?, model_id.to_string(), model.tier))
+    Some(model.to_model(slug, entry.spec()?, model_id.to_string()))
 }
 
 pub fn find_model_for_tier(slug: &str, tier: ModelTier) -> Option<Model> {
     let entry = entry(slug)?;
     let model = entry.decl.models.iter().find(|model| model.tier == tier)?;
-    Some(model.to_model(slug, entry.spec()?, model.canonical_id()?.to_string(), tier))
+    Some(model.to_model(slug, entry.spec()?, model.canonical_id()?.to_string()))
 }
 
+/// A declaration that curates no table of its own borrows the one behind its
+/// spec row, the same table the built-in serves.
 pub fn plugin_model_specs_for(slug: &str) -> Vec<String> {
     let Some(entry) = entry(slug) else {
         return Vec::new();
     };
-    if entry.decl.models.is_empty() {
-        return entry
+    let ids: Vec<&str> = if entry.decl.models.is_empty() {
+        entry
             .spec()
             .map(|spec| {
                 spec.models()
                     .iter()
-                    .flat_map(|entry| entry.prefixes.iter())
-                    .map(|prefix| format!("{slug}/{prefix}"))
+                    .flat_map(|row| row.prefixes.iter().copied())
                     .collect()
             })
-            .unwrap_or_default();
-    }
-    entry
-        .decl
-        .models
-        .iter()
-        .filter_map(PluginModel::canonical_id)
-        .map(|id| format!("{slug}/{id}"))
-        .collect()
+            .unwrap_or_default()
+    } else {
+        entry
+            .decl
+            .models
+            .iter()
+            .filter_map(PluginModel::canonical_id)
+            .collect()
+    };
+    ids.into_iter().map(|id| format!("{slug}/{id}")).collect()
 }
 
-pub fn registered_slugs() -> Vec<String> {
-    entries().keys().map(|slug| slug.to_string()).collect()
+/// The slugs only a declaration knows about. A claim is left out: it answers
+/// for a built-in row, and whatever lists the built-ins already lists it, with
+/// the built-in's rule for a provider that has no key.
+pub fn unclaimed_slugs() -> Vec<String> {
+    entries()
+        .values()
+        .filter(|entry| entry.claimed.is_none())
+        .map(|entry| entry.decl.slug.clone())
+        .collect()
 }
 
 pub fn auth_providers() -> Vec<(String, String)> {
@@ -1454,6 +1660,13 @@ mod tests {
 
     const DISPLAY_NAME: &str = "Plugin";
     const SOME_SYSTEM_PREFIX: &str = "You are X.";
+    const MODEL_ID: &str = "plug-1";
+    const MODEL_ALIAS: &str = "plug";
+    /// Matches [`MODEL_ALIAS`] by prefix and [`MODEL_ID`] more tightly, which
+    /// is what makes a lookup prove it took the longest match.
+    const MODEL_VARIANT: &str = "plug-1-mini";
+    const MODEL_TIER: ModelTier = ModelTier::Strong;
+    const UNDECLARED_BASE_URL: &str = "https://evil.test/v1";
     /// A native built-in with a curated table, claimed with a codec that is
     /// deliberately not its own so inheritance cannot be mistaken for the
     /// target's fallback.
@@ -1464,10 +1677,12 @@ mod tests {
     const CLAIM_LOST_THE_TABLE: &str = "a claim serves the curated table it inherited";
     const RELOAD_DROPS_STALE: &str = "a new load must not inherit the last load's entries";
     const RELOAD_KEEPS_SERVING: &str = "a load in progress must not unpublish what is serving";
-    const RUST_DECL_LOST: &str = "the rust decl must keep a slug no lua decl took";
-    const LUA_DECL_LOST: &str = "a lua decl takes the slug off the rust one by default";
-    const STANDING_RUST: &str = "standing=Rust";
-    const SILENT_FALLBACK: &str = "a fallback must name the slug, the sources and the error";
+    const WRONG_AUTHOR_SERVING: &str = "the wrong author's declaration is serving the slug";
+    const PRECEDENCE_MISMATCH: &str = "the lua half of the load was not rejected as expected";
+    const FIRST_LUA_DECL_REJECTED: &str = "the first lua decl must take the slug";
+    const LEASE_LOST: &str = "the origin the auth hook leased must reach the auth cell";
+    const RESERVED_SLUG_TAKEN: &str = "a refused declaration must not be serving the slug";
+    const SHADOWED_SERVES: &str = "the decl that lost its slug reported itself as serving";
 
     fn decl(slug: &str) -> ProviderDecl {
         ProviderDecl {
@@ -1483,8 +1698,8 @@ mod tests {
             thinking_dialect: None,
             models: vec![
                 serde_json::from_value(serde_json::json!({
-                    "prefixes": ["plug-1", "plug"],
-                    "tier": "strong"
+                    "prefixes": [MODEL_ID, MODEL_ALIAS],
+                    "tier": MODEL_TIER,
                 }))
                 .unwrap(),
             ],
@@ -1502,18 +1717,26 @@ mod tests {
     /// A test registers the way a plugin load does: open the window, register,
     /// publish. Entries from the previous load go, exactly as on a `/reload`.
     fn register_loaded(reg: Registration) -> Result<(), RegisterError> {
+        register_loaded_as(reg, DeclAuthority::ThirdParty)
+    }
+
+    /// [`register_loaded`] for the declarations maki itself ships, which are
+    /// the only ones that may take a built-in slug.
+    fn register_loaded_as(
+        reg: Registration,
+        authority: DeclAuthority,
+    ) -> Result<(), RegisterError> {
         begin_load();
-        let result = register(reg, DeclSource::Lua);
+        let result = register(reg, DeclSource::Lua, authority);
         commit_load();
-        result
+        result.map(drop)
     }
 
     struct CountingAuth {
         calls: AtomicUsize,
         rotating: bool,
-        /// The origin this hook leases, which is the only way an origin ever
-        /// reaches the auth cell now that a declared one is the codec's last
-        /// resort instead.
+        /// The origin this hook leases. A hook is the only way an origin ever
+        /// reaches the auth cell, a declared one being the codec's last resort.
         base_url: Option<String>,
     }
 
@@ -1541,9 +1764,8 @@ mod tests {
     impl Hook<AuthPurpose, PluginAuth> for CountingAuth {
         /// Yields before counting, so a caller that reaches here is observably
         /// in flight when its peer is next polled. Without that the fence would
-        /// only hold for as long as `run_auth_hook` keeps an await ahead of the
-        /// hook, which is an implementation detail of the caller, not of the
-        /// gate under test.
+        /// only hold for as long as [`PluginEntry::run_auth`] keeps an await
+        /// ahead of the hook, which is the caller's business and not the gate's.
         fn call(&self, _purpose: AuthPurpose) -> BoxFuture<'_, Result<PluginAuth, AgentError>> {
             Box::pin(async move {
                 smol::future::yield_now().await;
@@ -1558,6 +1780,28 @@ mod tests {
                             CONSTANT_TOKEN.to_string()
                         },
                     )]),
+                })
+            })
+        }
+    }
+
+    /// Says when it has started, then holds on until released, so a test can
+    /// drop the caller while the hook is known to be mid-flight.
+    struct ParkedAuth {
+        entered: flume::Sender<()>,
+        released: flume::Receiver<()>,
+        calls: AtomicUsize,
+    }
+
+    impl Hook<AuthPurpose, PluginAuth> for ParkedAuth {
+        fn call(&self, _purpose: AuthPurpose) -> BoxFuture<'_, Result<PluginAuth, AgentError>> {
+            Box::pin(async move {
+                let _ = self.entered.send(());
+                let _ = self.released.recv_async().await;
+                self.calls.fetch_add(1, Ordering::AcqRel);
+                Ok(PluginAuth {
+                    base_url: None,
+                    headers: HashMap::from([(AUTH_HEADER.to_string(), FIRST_TOKEN.to_string())]),
                 })
             })
         }
@@ -1612,12 +1856,13 @@ mod tests {
     fn entry_with(hooks: ProviderHooks) -> Arc<PluginEntry> {
         const SLUG: &str = "in-memory";
         let decl = decl(SLUG);
-        let auth = AuthState::new(SLUG, &decl.net_hosts).unwrap();
+        let auth = AuthState::new(SLUG).unwrap();
         auth.redeclare(SLUG, None, &decl.net_hosts).unwrap();
         Arc::new(PluginEntry {
             decl,
             claimed: None,
             source: DeclSource::Lua,
+            owner: None,
             target: Target::Codec(Protocol::Openai),
             hooks,
             auth: Arc::new(auth),
@@ -1634,6 +1879,12 @@ mod tests {
 
     fn token(entry: &PluginEntry) -> String {
         entry.auth.current.lock().unwrap().headers[0].1.clone()
+    }
+
+    fn base_url(slug: &str) -> Option<String> {
+        let entry = entry(slug).unwrap();
+        let auth = entry.auth.current.lock().unwrap();
+        auth.base_url.clone()
     }
 
     #[test_case("myslug", true ; "valid_simple")]
@@ -1729,10 +1980,10 @@ mod tests {
     /// only go once the replacements are ready, so a read landing while the
     /// load runs still gets the generation that is actually serving.
     #[test]
-    fn a_new_load_drops_the_previous_load_s_entries() {
+    fn a_new_load_drops_the_entries_of_the_previous_one() {
         const SLUG: &str = "stale-plugin";
+        const CREDENTIALS_DROPPED: &str = "credentials must outlive the load that registered them";
         register_loaded(registration(SLUG)).unwrap();
-        assert!(is_registered(SLUG));
 
         begin_load();
         assert!(is_registered(SLUG), "{RELOAD_KEEPS_SERVING}");
@@ -1741,7 +1992,7 @@ mod tests {
         assert!(!is_registered(SLUG), "{RELOAD_DROPS_STALE}");
         assert!(
             AUTH.read().unwrap().contains_key(SLUG),
-            "credentials outlive the load that registered them"
+            "{CREDENTIALS_DROPPED}"
         );
     }
 
@@ -1765,12 +2016,9 @@ mod tests {
         create(SLUG, Timeouts::default()).unwrap();
         assert_eq!(display_name(SLUG).as_deref(), Some(DISPLAY_NAME));
         assert!(base_for_slug(SLUG).is_some());
-        assert_eq!(lookup_model(SLUG, "plug-1-mini").unwrap().id, "plug-1-mini");
-        assert_eq!(
-            find_model_for_tier(SLUG, ModelTier::Strong).unwrap().id,
-            "plug-1"
-        );
-        assert_eq!(plugin_model_specs_for(SLUG), [format!("{SLUG}/plug-1")]);
+        assert_eq!(lookup_model(SLUG, MODEL_VARIANT).unwrap().id, MODEL_VARIANT);
+        assert_eq!(find_model_for_tier(SLUG, MODEL_TIER).unwrap().id, MODEL_ID);
+        assert_eq!(plugin_model_specs_for(SLUG), [format!("{SLUG}/{MODEL_ID}")]);
         assert_eq!(
             auth_providers(),
             [(SLUG.to_string(), DISPLAY_NAME.to_string())]
@@ -1780,13 +2028,17 @@ mod tests {
     /// Availability follows the declaration and not who wrote it: a decl that
     /// names an `api_key_env` answers for its key, so `create` fails while
     /// there is none and the picker hides the provider rather than listing one
-    /// that cannot serve a request. A key that appears later needs no reload.
+    /// that cannot serve a request. A key that appears later needs no reload,
+    /// and neither does one that replaces a key the provider already had,
+    /// which is what a user does after the old one was revoked.
     #[test]
     fn a_declared_key_env_decides_availability() {
         const SLUG: &str = "keyed-plugin";
         const ENV_VAR: &str = "MAKI_TEST_KEYED_PLUGIN_KEY";
         const KEY: &str = "sk-keyed";
+        const REPLACED_KEY: &str = "sk-replaced";
         const LISTED_BUT_KEYLESS: &str = "a declared key env with no key must not build";
+        const STALE_KEY: &str = "a replaced key must reach the next provider built";
         let mut reg = registration(SLUG);
         reg.decl.api_key_env = Some(ENV_VAR.to_string());
         register_loaded(reg).unwrap();
@@ -1799,6 +2051,97 @@ mod tests {
         unsafe { std::env::set_var(ENV_VAR, KEY) };
         create(SLUG, Timeouts::default()).unwrap();
         assert_eq!(token(&entry(SLUG).unwrap()), format!("Bearer {KEY}"));
+
+        unsafe { std::env::set_var(ENV_VAR, REPLACED_KEY) };
+        create(SLUG, Timeouts::default()).unwrap();
+        assert_eq!(
+            token(&entry(SLUG).unwrap()),
+            format!("Bearer {REPLACED_KEY}"),
+            "{STALE_KEY}"
+        );
+    }
+
+    /// A claim answers for a built-in row, so the built-ins' listing already
+    /// covers it; listing it again as a plugin doubled every model it has and,
+    /// with no key, offered the models anyway under a warning.
+    #[test]
+    fn only_a_slug_no_builtin_owns_is_listed_as_a_plugin() {
+        const SLUG: &str = "unclaimed-plugin";
+        begin_load();
+        register(
+            registration(SLUG),
+            DeclSource::Lua,
+            DeclAuthority::ThirdParty,
+        )
+        .unwrap();
+        register(claim(CLAIMED_SLUG), DeclSource::Lua, DeclAuthority::Bundled).unwrap();
+        commit_load();
+
+        assert_eq!(unclaimed_slugs(), [SLUG]);
+    }
+
+    /// A plugin whose load fails after registering must leave no provider
+    /// behind: a slug only it declared goes, and a Rust decl it displaced
+    /// serves again, exactly as if the plugin had never loaded.
+    #[test]
+    fn a_discarded_plugin_leaves_nothing_staged() {
+        const PLUGIN: &str = "failed-plugin";
+        const SLUG: &str = "failed-plugin-slug";
+        const DISCARDED_SERVES: &str = "a failed plugin's provider was published";
+        const DISPLACED_NOT_RESTORED: &str = "the decl a failed plugin displaced must serve again";
+        let displaced = deepseek::decl().slug;
+        begin_load();
+        register_plugin(
+            Arc::from(PLUGIN),
+            registration(SLUG),
+            DeclAuthority::ThirdParty,
+        )
+        .unwrap();
+        let takeover = Registration {
+            decl: deepseek::decl(),
+            hooks: deepseek::hooks(),
+        };
+        register_plugin(Arc::from(PLUGIN), takeover, DeclAuthority::Bundled).unwrap();
+        discard(PLUGIN);
+        commit_load();
+
+        assert!(!is_registered(SLUG), "{DISCARDED_SERVES}");
+        assert_eq!(
+            source_of(&displaced),
+            Some(DeclSource::Rust),
+            "{DISPLACED_NOT_RESTORED}"
+        );
+    }
+
+    /// A refresh spends a single-use token, so the caller going away (an Esc,
+    /// a turn that timed out) must not abandon it halfway: the hook runs to
+    /// the end, what it minted lands, and the gate stays shut until it has.
+    #[test]
+    fn a_refresh_outlives_the_caller_that_started_it() {
+        const MINT_DROPPED: &str = "what the abandoned refresh minted never landed";
+        let (entered_tx, entered) = flume::bounded(1);
+        let (release, released) = flume::bounded(1);
+        let hook = Arc::new(ParkedAuth {
+            entered: entered_tx,
+            released,
+            calls: AtomicUsize::new(0),
+        });
+        let entry = entry_with(ProviderHooks {
+            auth: Some(hook.clone()),
+            ..ProviderHooks::default()
+        });
+
+        smol::block_on(async {
+            let abandoned =
+                futures_lite::future::poll_once(entry.run_auth(AuthPurpose::Refresh)).await;
+            assert!(abandoned.is_none());
+            entered.recv_async().await.unwrap();
+            release.send(()).unwrap();
+            let _gate = entry.auth.gate.lock.lock().await;
+        });
+
+        assert_eq!(hook.calls.load(Ordering::Acquire), 1, "{ONE_HOOK_CALL}");
+        assert_eq!(token(&entry), FIRST_TOKEN, "{MINT_DROPPED}");
     }
 
     /// The 401 replay is a credential refresh, not a retry: a declaration
@@ -1811,16 +2154,16 @@ mod tests {
         /// `<SLUG>_BASE_URL`, which is how the codec reaches loopback.
         const BASE_URL_ENV: &str = "HOOKLESS_401_PLUGIN_BASE_URL";
         const KEY: &str = "sk-rejected";
-        const MODEL_ID: &str = "plug-1";
         const PROMPT: &str = "read a.txt";
+        const UNAUTHORIZED: u16 = 401;
         const UNAUTHORIZED_BODY: &str = r#"{"error":{"message":"invalid api key"}}"#;
         const REJECTED_TWICE: &str = "a decl with no auth hook re-sent the rejected key";
-        const STILL_AUTHORIZED: &str = "a 401 must reach the caller";
+        const STILL_AUTHORIZED: &str = "the auth error must reach the caller";
         /// Two answers so a replaying provider is recorded rather than parked
         /// on an `accept` that never returns.
         const SCRIPT: &[Canned] = &[
-            Canned::json(401, UNAUTHORIZED_BODY),
-            Canned::json(401, UNAUTHORIZED_BODY),
+            Canned::json(UNAUTHORIZED, UNAUTHORIZED_BODY),
+            Canned::json(UNAUTHORIZED, UNAUTHORIZED_BODY),
         ];
 
         let (base_url, requests) = serve(SCRIPT);
@@ -1855,12 +2198,12 @@ mod tests {
 
     /// A decl that claims a built-in slug states only what the row does not
     /// already answer, and every inherited answer comes off the row: the name,
-    /// the curated table, and the spec behind it -- which here is *not* the
-    /// one the declared codec would have resolved to.
+    /// the curated table, and the spec behind it, which here is *not* the one
+    /// the declared codec would have resolved to.
     #[test]
     fn a_claim_inherits_the_spec_row() {
         let spec = ProviderRegistry::get(CLAIMED_SLUG).expect(NO_CLAIMED_SPEC);
-        register_loaded(claim(CLAIMED_SLUG)).unwrap();
+        register_loaded_as(claim(CLAIMED_SLUG), DeclAuthority::Bundled).unwrap();
 
         assert_eq!(
             display_name(CLAIMED_SLUG).as_deref(),
@@ -1890,7 +2233,7 @@ mod tests {
         const KNOWN: &str = "deepseek";
         const UNKNOWN: &str = "not-a-dialect";
         let resolved = thinking_dialect(SLUG, KNOWN).unwrap();
-        assert_eq!(resolved, &crate::types::dialect::DEEPSEEK);
+        assert_eq!(resolved, &dialect::DEEPSEEK);
 
         let error = thinking_dialect(SLUG, UNKNOWN).unwrap_err().to_string();
         assert!(error.contains(UNKNOWN) && error.contains(KNOWN), "{error}");
@@ -1928,27 +2271,19 @@ mod tests {
         reg.decl.api_key_env = Some("PLUGIN_API_KEY".to_string());
     }
 
+    /// A claim keeping the table [`claim`] drops.
     fn claim_restating_the_model_table(reg: &mut Registration) {
-        let models = std::mem::take(&mut reg.decl.models);
-        *reg = claim(CLAIMED_SLUG);
-        reg.decl.models = models;
-    }
-
-    /// A claim is a registration like any other: the checks a new slug passes
-    /// are the same ones it passes. From the same author, as a collision is:
-    /// two authors for one slug is [`wins`]'s question, not an error.
-    fn claim_registered_twice(reg: &mut Registration) {
-        *reg = claim(CLAIMED_SLUG);
-        register(claim(CLAIMED_SLUG), DeclSource::Lua).unwrap();
-    }
-
-    fn claim_without_net_hosts(reg: &mut Registration) {
-        *reg = claim(CLAIMED_SLUG);
-        reg.decl.net_hosts.clear();
+        *reg = registration(CLAIMED_SLUG);
+        reg.decl.display_name = None;
     }
 
     fn already_registered(reg: &mut Registration) {
-        register(registration(&reg.decl.slug), DeclSource::Lua).unwrap();
+        register(
+            registration(&reg.decl.slug),
+            DeclSource::Lua,
+            DeclAuthority::Bundled,
+        )
+        .unwrap();
     }
 
     fn codec_and_base(reg: &mut Registration) {
@@ -1987,7 +2322,7 @@ mod tests {
     }
 
     fn base_url_off_the_declared_hosts(reg: &mut Registration) {
-        reg.decl.base_url = Some("https://evil.test/v1".to_string());
+        reg.decl.base_url = Some(UNDECLARED_BASE_URL.to_string());
     }
 
     /// A declared host reached over plaintext still puts the token on the wire
@@ -2005,8 +2340,6 @@ mod tests {
     #[test_case(claim_restating_the_display_name, |e| matches!(e, RegisterError::Restated { field, .. } if *field == DISPLAY_NAME_FIELD) ; "claim_restates_display_name")]
     #[test_case(claim_restating_the_api_key_env, |e| matches!(e, RegisterError::Restated { field, .. } if *field == API_KEY_ENV_FIELD) ; "claim_restates_api_key_env")]
     #[test_case(claim_restating_the_model_table, |e| matches!(e, RegisterError::Restated { field, .. } if *field == MODELS_FIELD) ; "claim_restates_models")]
-    #[test_case(claim_registered_twice, |e| matches!(e, RegisterError::DuplicateSlug(_)) ; "claim_duplicate")]
-    #[test_case(claim_without_net_hosts, |e| matches!(e, RegisterError::NoNetHosts(_)) ; "claim_net_hosts_empty")]
     #[test_case(already_registered, |e| matches!(e, RegisterError::DuplicateSlug(_)) ; "duplicate")]
     #[test_case(codec_and_base, |e| matches!(e, RegisterError::CodecOrBase(_)) ; "codec_and_base_together")]
     #[test_case(missing_base, |e| matches!(e, RegisterError::UnknownBase { .. }) ; "unknown_base")]
@@ -2022,17 +2355,57 @@ mod tests {
         begin_load();
         let mut reg = registration(SLUG);
         mutate(&mut reg);
-        let error = register(reg, DeclSource::Lua).unwrap_err();
+        let error = register(reg, DeclSource::Lua, DeclAuthority::Bundled).unwrap_err();
         assert!(expected(&error), "{error}");
         commit_load();
     }
 
-    /// What [`begin_load`] does with [`RUST_DECLS`], for a slug maki ships no
-    /// declaration for: a Rust-authored decl staged before any plugin gets to
-    /// speak.
+    /// A built-in slug is maki's to declare and nobody else's. Claiming one
+    /// inherits its `api_key_env`, so a package that took `anthropic` would
+    /// have the user's Anthropic key resolved into its own credentials and
+    /// sent to the origin it declared. That is reach a grant of `net` plus a
+    /// host list never bought, under a name the picker still labels
+    /// "Anthropic".
+    ///
+    /// Refused outright rather than demoted to a non-claim, because a third
+    /// party serving `anthropic` on its own terms is the same theft without
+    /// the inheritance.
+    #[test]
+    fn a_third_party_cannot_declare_a_builtin_slug() {
+        let error = register_loaded(registration(CLAIMED_SLUG)).unwrap_err();
+
+        assert!(matches!(error, RegisterError::ReservedSlug(_)), "{error}");
+        assert!(!is_registered(CLAIMED_SLUG), "{RESERVED_SLUG_TAKEN}");
+    }
+
+    /// A decl that loses its slug is well formed, since `impl = "rust"` is a
+    /// user choice and not a defect, so it registers without error. It must
+    /// still say that it is not the one serving, because every grant a caller
+    /// hangs off a registration belongs to the winner alone.
+    #[test]
+    fn a_shadowed_decl_registers_without_serving() {
+        const SLUG: &str = "shadowed-decl";
+        load_with_rust_decl(SLUG);
+
+        let first = register(
+            registration(SLUG),
+            DeclSource::Lua,
+            DeclAuthority::ThirdParty,
+        );
+        // Lua wins by default, so the rust decl is the one shadowed on the way
+        // back: same slug, same call, the other author.
+        let second = register(registration(SLUG), DeclSource::Rust, DeclAuthority::Bundled);
+        commit_load();
+
+        assert_eq!(first.unwrap(), Registered::Serving);
+        assert_eq!(second.unwrap(), Registered::Shadowed, "{SHADOWED_SERVES}");
+    }
+
+    /// Stands in for what [`begin_load`] does with [`RUST_DECLS`], for a slug
+    /// maki ships no declaration for: staged before any plugin gets to speak.
     fn load_with_rust_decl(slug: &str) {
         begin_load();
-        register(registration(slug), DeclSource::Rust).unwrap();
+        register(registration(slug), DeclSource::Rust, DeclAuthority::Bundled).unwrap();
     }
 
     fn source_of(slug: &str) -> Option<DeclSource> {
@@ -2064,90 +2437,73 @@ mod tests {
         assert_eq!(defines_provider(&def), expected);
     }
 
-    #[test]
-    fn a_slug_no_plugin_declares_keeps_its_rust_decl() {
-        const SLUG: &str = "unclaimed-by-lua";
-        load_with_rust_decl(SLUG);
-        commit_load();
-
-        assert_eq!(source_of(SLUG), Some(DeclSource::Rust), "{RUST_DECL_LOST}");
+    fn lua_says_nothing(_slug: &str) -> Option<RegisterError> {
+        None
     }
 
-    /// The default, and the reason the Lua authoring surface is the one the
-    /// field exercises. A second decl from the *same* source is still a
-    /// collision: it is the author that decides precedence, never the slug.
-    #[test]
-    fn a_lua_decl_takes_the_slug_and_a_second_one_collides() {
-        const SLUG: &str = "declared-twice";
-        load_with_rust_decl(SLUG);
-
-        register(registration(SLUG), DeclSource::Lua).unwrap();
-        let error = register(registration(SLUG), DeclSource::Lua).unwrap_err();
-        commit_load();
-
-        assert!(matches!(error, RegisterError::DuplicateSlug(_)), "{error}");
-        assert_eq!(source_of(SLUG), Some(DeclSource::Lua), "{LUA_DECL_LOST}");
+    fn one_lua_decl(slug: &str) -> Option<RegisterError> {
+        lua_decl(registration(slug))
     }
 
-    /// A broken Lua decl costs the plugin author an error and costs the user
-    /// nothing: the Rust decl keeps serving the slug. Silently, that would be
-    /// a provider behaving unlike the one whose file the user is reading, so
-    /// the fallback names the slug, both sources and the load error.
-    #[test]
-    fn a_lua_decl_that_fails_leaves_the_rust_decl_standing() {
-        const SLUG: &str = "broken-lua-decl";
-        load_with_rust_decl(SLUG);
+    fn two_lua_decls(slug: &str) -> Option<RegisterError> {
+        assert!(one_lua_decl(slug).is_none(), "{FIRST_LUA_DECL_REJECTED}");
+        one_lua_decl(slug)
+    }
 
-        let mut reg = registration(SLUG);
+    fn a_broken_lua_decl(slug: &str) -> Option<RegisterError> {
+        let mut reg = registration(slug);
         no_net_hosts(&mut reg);
-        let (error, logs) = capturing_warnings(|| register(reg, DeclSource::Lua).unwrap_err());
+        lua_decl(reg)
+    }
+
+    fn lua_decl(reg: Registration) -> Option<RegisterError> {
+        register(reg, DeclSource::Lua, DeclAuthority::ThirdParty).err()
+    }
+
+    /// Who ends up serving a slug maki already declared, once the Lua half of
+    /// the load has had its say. Lua wins by default, which keeps everyday use
+    /// on the authoring surface plugin authors write against, and a Lua decl
+    /// that fails costs the user nothing: the shipped decl it never displaced
+    /// keeps serving, and `register` warns so that "why is this provider odd"
+    /// has something to go on.
+    ///
+    /// A second decl from the *same* author is a collision either way. The
+    /// author decides precedence, never the slug.
+    #[test_case(lua_says_nothing, DeclSource::Rust, None ; "silence_leaves_the_rust_decl")]
+    #[test_case(one_lua_decl, DeclSource::Lua, None ; "a_lua_decl_takes_the_slug")]
+    #[test_case(two_lua_decls, DeclSource::Lua, Some(|e| matches!(e, RegisterError::DuplicateSlug(_))) ; "a_second_lua_decl_collides")]
+    #[test_case(a_broken_lua_decl, DeclSource::Rust, Some(|e| matches!(e, RegisterError::NoNetHosts(_))) ; "a_broken_lua_decl_changes_nothing")]
+    fn the_lua_half_of_a_load_decides_the_author(
+        lua: fn(&str) -> Option<RegisterError>,
+        serving: DeclSource,
+        rejected: Option<fn(&RegisterError) -> bool>,
+    ) {
+        const SLUG: &str = "contested-slug";
+        load_with_rust_decl(SLUG);
+        let rejection = lua(SLUG);
         commit_load();
 
-        assert!(matches!(error, RegisterError::NoNetHosts(_)), "{error}");
-        assert_eq!(source_of(SLUG), Some(DeclSource::Rust), "{RUST_DECL_LOST}");
-        let message = error.to_string();
-        for expected in [SLUG, STANDING_RUST, message.as_str()] {
-            assert!(logs.contains(expected), "{SILENT_FALLBACK}: {logs}");
+        assert_eq!(
+            rejection.is_some(),
+            rejected.is_some(),
+            "{PRECEDENCE_MISMATCH}: {rejection:?}"
+        );
+        if let (Some(expected), Some(error)) = (rejected, &rejection) {
+            assert!(expected(error), "{error}");
         }
+        assert_eq!(source_of(SLUG), Some(serving), "{WRONG_AUTHOR_SERVING}");
     }
 
-    #[derive(Clone, Default)]
-    struct CapturedLogs(Arc<Mutex<Vec<u8>>>);
-
-    impl std::io::Write for CapturedLogs {
-        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-            self.0.lock().unwrap().extend_from_slice(buf);
-            Ok(buf.len())
-        }
-
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-
-    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedLogs {
-        type Writer = Self;
-
-        fn make_writer(&'a self) -> Self::Writer {
-            self.clone()
-        }
-    }
-
-    fn capturing_warnings<T>(work: impl FnOnce() -> T) -> (T, String) {
-        let logs = CapturedLogs::default();
-        let subscriber = tracing_subscriber::fmt()
-            .with_writer(logs.clone())
-            .with_max_level(tracing::Level::WARN)
-            .finish();
-        let out = tracing::subscriber::with_default(subscriber, work);
-        let written = String::from_utf8(logs.0.lock().unwrap().clone()).unwrap();
-        (out, written)
-    }
+    const UPSTREAM_SAID_NO: &str = "upstream said no";
+    /// A status maki never retries, so a mapping that changes nothing is
+    /// visible in `retry_kind` as well as in the status.
+    const NOT_RETRYABLE: u16 = 418;
+    const RATE_LIMITED: u16 = 429;
 
     fn api_error(status: u16, retry_after: Option<Duration>) -> AgentError {
         AgentError::Api {
             status,
-            message: "upstream said no".to_string(),
+            message: UPSTREAM_SAID_NO.to_string(),
             retry_after,
         }
     }
@@ -2155,12 +2511,19 @@ mod tests {
     #[test]
     fn map_error_absent_leaves_the_error_untouched() {
         let provider = provider_with(ProviderHooks::default());
-        let error = smol::block_on(provider.mapped::<()>(Err(api_error(418, None)))).unwrap_err();
-        assert!(matches!(error, AgentError::Api { status: 418, .. }));
+        let error =
+            smol::block_on(provider.mapped::<()>(Err(api_error(NOT_RETRYABLE, None)))).unwrap_err();
+        assert!(matches!(
+            error,
+            AgentError::Api {
+                status: NOT_RETRYABLE,
+                ..
+            }
+        ));
         assert_eq!(error.retry_kind(), None);
     }
 
-    /// The hook restates status and message; retryability and `Retry-After`
+    /// The hook restates status and message. Retryability and `Retry-After`
     /// stay maki's to decide.
     #[test]
     fn map_error_remaps_the_status_only() {
@@ -2168,17 +2531,18 @@ mod tests {
         const REMAPPED: &str = "slow down";
         let provider = provider_with(ProviderHooks {
             map_error: Some(Arc::new(RemapHook(Some(ApiError {
-                status: 429,
+                status: RATE_LIMITED,
                 message: REMAPPED.to_string(),
             })))),
             ..ProviderHooks::default()
         });
 
-        let error = smol::block_on(provider.mapped::<()>(Err(api_error(400, Some(RETRY_AFTER)))))
-            .unwrap_err();
+        let error =
+            smol::block_on(provider.mapped::<()>(Err(api_error(NOT_RETRYABLE, Some(RETRY_AFTER)))))
+                .unwrap_err();
 
         assert!(
-            matches!(&error, AgentError::Api { status: 429, message, .. } if message == REMAPPED)
+            matches!(&error, AgentError::Api { status: RATE_LIMITED, message, .. } if message == REMAPPED)
         );
         assert_eq!(error.retry_kind(), Some(RetryKind::RateLimit));
         assert_eq!(error.retry_after(), Some(RETRY_AFTER));
@@ -2188,23 +2552,24 @@ mod tests {
     fn plugin_auth_rejects_an_undeclared_base_url() {
         const SLUG: &str = "egress-plugin";
         let hosts = vec![EXAMPLE_HOST.to_string()];
+        let declared = format!("{EXAMPLE_BASE_URL}/v1");
         let auth = |base_url: &str| PluginAuth {
             base_url: Some(base_url.to_string()),
             headers: HashMap::new(),
         };
 
         assert!(
-            auth("https://evil.test/v1")
+            auth(UNDECLARED_BASE_URL)
                 .into_resolved(SLUG, &hosts)
                 .is_err()
         );
         assert_eq!(
-            auth(&format!("https://{EXAMPLE_HOST}/v1"))
+            auth(&declared)
                 .into_resolved(SLUG, &hosts)
                 .unwrap()
                 .base_url
                 .as_deref(),
-            Some("https://example.com/v1")
+            Some(declared.as_str())
         );
     }
 
@@ -2216,66 +2581,56 @@ mod tests {
     #[test_case("http://127.0.0.1:8080/v1", "127.0.0.1", true ; "plaintext_to_a_loopback_address")]
     #[test_case("ftp://example.com/v1", EXAMPLE_HOST, false ; "a_scheme_that_is_neither")]
     fn base_url_scheme(url: &str, host: &str, accepted: bool) {
+        const SLUG: &str = "scheme-plugin";
         let hosts = vec![host.to_string()];
         assert_eq!(
-            declared_base_url("scheme-plugin", Some(url.to_string()), &hosts).is_ok(),
+            declared_base_url(SLUG, Some(url.to_string()), &hosts).is_ok(),
             accepted,
             "{url}"
         );
     }
 
-    /// What the append-only auth map must *not* cost: a reload re-reads the
-    /// registration, so a provider that has minted nothing takes the fresh
-    /// declaration, while an origin a hook leased is left alone as long as the
-    /// new declaration still covers it.
+    /// What the per-slug auth cell must and must not carry across a reload: a
+    /// slug that has minted nothing takes the fresh declaration, an origin a
+    /// hook leased survives as long as the new declaration still covers it,
+    /// and it goes the moment a narrowed host list stops covering it.
     ///
-    /// The origin is the hook's, not the declaration's: a declared `base_url`
-    /// is the codec's last resort now and never reaches the auth cell, which
-    /// is what keeps a plugin from outranking the user's `<SLUG>_BASE_URL`.
-    #[test_case(false, None ; "an_unminted_slug_takes_the_fresh_declaration")]
-    #[test_case(true, Some(OTHER_BASE_URL) ; "a_leased_origin_survives_the_reload")]
-    fn a_reload_re_reads_the_declaration(minted: bool, expected: Option<&str>) {
+    /// The origin is always the hook's. A declared `base_url` is the codec's
+    /// last resort and never reaches the auth cell, which is what keeps a
+    /// plugin from outranking the user's `<SLUG>_BASE_URL`.
+    #[test_case(false, true, None ; "an_unminted_slug_takes_the_fresh_declaration")]
+    #[test_case(true, true, Some(OTHER_BASE_URL) ; "a_leased_origin_survives_the_reload")]
+    #[test_case(true, false, None ; "narrowing_the_hosts_drops_an_origin_they_no_longer_cover")]
+    fn a_reload_re_reads_the_declaration(
+        minted: bool,
+        still_covered: bool,
+        expected: Option<&str>,
+    ) {
         const SLUG: &str = "redeclare-plugin";
-        let hook = Arc::new(CountingAuth::leasing(OTHER_BASE_URL));
-        let declaration = || {
+        let declaration = |covers_the_lease: bool| {
             let mut reg = registration(SLUG);
-            reg.decl.net_hosts.push(OTHER_HOST.to_string());
+            if covers_the_lease {
+                reg.decl.net_hosts.push(OTHER_HOST.to_string());
+            }
             reg
         };
 
-        let mut first = declaration();
+        let mut first = declaration(true);
         if minted {
-            first.hooks.auth = Some(hook.clone());
+            first.hooks.auth = Some(Arc::new(CountingAuth::leasing(OTHER_BASE_URL)));
         }
         register_loaded(first).unwrap();
         if minted {
             smol::block_on(entry(SLUG).unwrap().ensure_auth()).unwrap();
+            assert_eq!(
+                base_url(SLUG).as_deref(),
+                Some(OTHER_BASE_URL),
+                "{LEASE_LOST}"
+            );
         }
-        register_loaded(declaration()).unwrap();
 
-        let auth = entry(SLUG).unwrap().auth.current.lock().unwrap().clone();
-        assert_eq!(auth.base_url.as_deref(), expected);
-    }
+        register_loaded(declaration(still_covered)).unwrap();
 
-    /// Credentials that stopped satisfying the declaration are not kept: a
-    /// reload that narrows the host list drops an origin it no longer covers,
-    /// rather than carrying the token to a host nobody declared any more.
-    #[test]
-    fn narrowing_the_declared_hosts_drops_an_origin_it_no_longer_covers() {
-        const SLUG: &str = "narrowed-plugin";
-        let mut wide = registration(SLUG);
-        wide.decl.net_hosts.push(OTHER_HOST.to_string());
-        wide.hooks.auth = Some(Arc::new(CountingAuth::leasing(OTHER_BASE_URL)));
-        register_loaded(wide).unwrap();
-        smol::block_on(entry(SLUG).unwrap().ensure_auth()).unwrap();
-        assert_eq!(
-            entry(SLUG).unwrap().auth.current.lock().unwrap().base_url,
-            Some(OTHER_BASE_URL.to_string())
-        );
-
-        register_loaded(registration(SLUG)).unwrap();
-
-        let auth = entry(SLUG).unwrap().auth.current.lock().unwrap().clone();
-        assert_eq!(auth.base_url, None);
+        assert_eq!(base_url(SLUG).as_deref(), expected);
     }
 }

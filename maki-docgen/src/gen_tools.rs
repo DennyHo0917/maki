@@ -238,7 +238,8 @@ fn load_registry_with_builtins() -> (Arc<ToolRegistry>, HashSet<String>) {
     let registry = Arc::new(ToolRegistry::new());
     let host = in_registration_window(|| {
         let mut host = PluginHost::new(Arc::clone(&registry)).expect("plugin host");
-        host.load_builtins(&config).expect("loading builtin plugins");
+        host.load_builtins(&config)
+            .expect("loading builtin plugins");
         host
     });
 

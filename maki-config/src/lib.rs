@@ -89,6 +89,7 @@ pub const DEFAULT_BUILTINS: &[&str] = &[
     "bash",
     "batch",
     "code_execution",
+    "deepseek",
     "edit",
     "glob",
     "grep",

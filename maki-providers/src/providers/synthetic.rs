@@ -51,18 +51,15 @@ pub(crate) const SPEC: ProviderSpec = ProviderSpec {
 
 inventory::submit!(SPEC.config_row());
 
-/// This provider as a declaration, which is all of it: the openai codec spells
-/// Synthetic's whole wire, so there is not one hook here.
+/// Synthetic as a declaration, which is all of it: the openai codec spells the
+/// whole wire, so there is not one hook here.
 ///
-/// Nothing the [`SPEC`] row already holds is restated. Claiming the built-in
-/// slug inherits the display name, the key env var, the family, the fallback
-/// limits and the curated model table, and restating any of them is a
-/// registration error rather than a second home for the same fact.
+/// Only what the codec cannot guess is stated. Claiming a built-in slug
+/// inherits the whole [`SPEC`] row, and restating any of it is a registration
+/// error rather than a second home for the same fact.
 ///
-/// Staged at every load from [`crate::providers::plugin`]'s list of the
-/// declarations maki authors, and outranked there by the bundled `synthetic`
-/// Lua plugin, which restates this same declaration on the authoring surface a
-/// third-party plugin uses.
+/// The bundled `synthetic` Lua plugin says all of this again on the surface a
+/// third-party plugin uses, and outranks this at every real startup.
 pub(crate) fn decl() -> ProviderDecl {
     ProviderDecl {
         slug: SLUG.to_owned(),
@@ -80,41 +77,30 @@ pub(crate) fn decl() -> ProviderDecl {
     }
 }
 
-/// Synthetic as [`decl`] puts it on the wire, one recorded exchange at a time.
+/// The recorded cases, kept out of the test module so both authorings replay
+/// the same list: [`decl`] above, and the bundled `synthetic` Lua plugin that
+/// outranks it at every real startup.
 ///
 /// Every case was recorded while the bespoke `impl Provider` this module used
-/// to hold was still here, running both against the same artifact. The impl is
-/// gone and the artifacts are not: each fixture is still pinned to the bytes
+/// to hold was still here, with both sides run against the same artifact. The
+/// impl is gone and the artifacts are not, so each fixture still pins the bytes
 /// and the events that provider produced on the day it was ported.
-#[cfg(test)]
-mod tests {
-    use tempfile::TempDir;
-    use test_case::test_case;
-
+#[cfg(any(test, feature = "test-support"))]
+pub mod fixtures {
     use crate::model::Model;
-    use crate::providers::replay::{self, Fixture};
-    use crate::providers::{Timeouts, plugin};
+    use crate::providers::replay::Fixture;
     use crate::test_support::Canned;
     use crate::{Effort, ThinkingConfig};
 
-    use super::{ENV_VAR, SLUG};
-
-    const MODEL_SPEC: &str = "synthetic/hf:moonshotai/Kimi-K2.5";
-    const BASE_URL_ENV: &str = "SYNTHETIC_BASE_URL";
-    const API_KEY: &str = "sk-replay";
+    pub const MODEL_SPEC: &str = "synthetic/hf:moonshotai/Kimi-K2.5";
     /// Reaches the wire as `reasoning_effort`, which is the one thing
     /// [`super::decl`]'s `thinking_dialect` is there to do.
     const EFFORT: Effort = Effort::High;
-
-    const TEMPDIR_FAILED: &str = "no temporary state directory";
     const UNKNOWN_MODEL: &str = "the curated table has no such model";
-    const CREATE_FAILED: &str = "the provider could not be built";
 
-    const UNAUTHORIZED_BODY: &str = r#"{"error":{"message":"invalid api key"}}"#;
-    const RATE_LIMITED_BODY: &str = r#"{"error":{"message":"too many requests"}}"#;
-    const SERVER_ERROR_BODY: &str = r#"{"error":{"message":"internal error"}}"#;
-    const RETRY_AFTER_HEADERS: &[(&str, &str)] =
-        &[("content-type", "application/json"), ("retry-after", "7")];
+    pub fn model() -> Model {
+        Model::from_spec(MODEL_SPEC).expect(UNKNOWN_MODEL)
+    }
 
     const SUCCESS_TRANSCRIPT: &str = r#"data: {"choices":[{"delta":{"reasoning_content":"weighing the options"}}]}
 
@@ -130,148 +116,32 @@ data: [DONE]
 
 "#;
 
-    /// One unparseable frame between two good ones: the bad frame is skipped
-    /// and the turn still ends, rather than the whole stream failing.
-    const MALFORMED_TRANSCRIPT: &str = r#"data: {"choices": [ this is not json
-
-data: {"choices":[{"delta":{"content":"Hello"}}]}
-
-data: [DONE]
-
-"#;
-
-    /// An error frame on a 200, carrying a tag but no message. The substituted
-    /// message is a real bug fix (`EMPTY_SSE_ERROR_MESSAGE`): without it the
-    /// turn ended with an empty assistant message and no retry.
-    const EMPTY_ERROR_TRANSCRIPT: &str = r#"data: {"error":{"type":"server_error","message":""}}
-
-"#;
-
-    /// Ends mid-frame, with no `finish_reason` and no `[DONE]`.
-    const TRUNCATED_TRANSCRIPT: &str = r#"data: {"choices":[{"delta":{"content":"Hel"}}]}
-
-data: {"choices":[{"delta":{"con"#;
-
-    const SUCCESS_SCRIPT: &[Canned] = &[Canned::sse(SUCCESS_TRANSCRIPT)];
-    const MALFORMED_SCRIPT: &[Canned] = &[Canned::sse(MALFORMED_TRANSCRIPT)];
-    const EMPTY_ERROR_SCRIPT: &[Canned] = &[Canned::sse(EMPTY_ERROR_TRANSCRIPT)];
-    const TRUNCATED_SCRIPT: &[Canned] = &[Canned::sse(TRUNCATED_TRANSCRIPT)];
-    /// A second answer neither side is expected to ask for: a run that replays
-    /// the rejected key is recorded as a second request rather than parking on
-    /// an `accept` that never returns.
-    const UNAUTHORIZED_SCRIPT: &[Canned] = &[
-        Canned::json(401, UNAUTHORIZED_BODY),
-        Canned::json(401, UNAUTHORIZED_BODY),
-    ];
-    const RATE_LIMITED_SCRIPT: &[Canned] = &[Canned::json(429, RATE_LIMITED_BODY)];
-    const SLOW_DOWN_SCRIPT: &[Canned] = &[Canned {
-        status: 429,
-        headers: RETRY_AFTER_HEADERS,
-        body: RATE_LIMITED_BODY,
-    }];
-    const SERVER_ERROR_SCRIPT: &[Canned] = &[Canned::json(500, SERVER_ERROR_BODY)];
-
-    const SUCCESS: Fixture = Fixture {
+    pub const SUCCESS: Fixture = Fixture {
         name: "success",
-        script: SUCCESS_SCRIPT,
+        script: &[Canned::sse(SUCCESS_TRANSCRIPT)],
         thinking: ThinkingConfig::Effort(EFFORT),
     };
-    const UNAUTHORIZED: Fixture = Fixture {
-        name: "unauthorized",
-        script: UNAUTHORIZED_SCRIPT,
-        thinking: ThinkingConfig::Off,
-    };
-    const SLOW_DOWN: Fixture = Fixture {
-        name: "rate_limited_with_retry_after",
-        script: SLOW_DOWN_SCRIPT,
-        thinking: ThinkingConfig::Off,
-    };
-    const RATE_LIMITED: Fixture = Fixture {
-        name: "rate_limited",
-        script: RATE_LIMITED_SCRIPT,
-        thinking: ThinkingConfig::Off,
-    };
-    const SERVER_ERROR: Fixture = Fixture {
-        name: "server_error",
-        script: SERVER_ERROR_SCRIPT,
-        thinking: ThinkingConfig::Off,
-    };
-    const MALFORMED: Fixture = Fixture {
-        name: "malformed_sse",
-        script: MALFORMED_SCRIPT,
-        thinking: ThinkingConfig::Off,
-    };
-    const EMPTY_ERROR: Fixture = Fixture {
-        name: "empty_sse_error_frame",
-        script: EMPTY_ERROR_SCRIPT,
-        thinking: ThinkingConfig::Off,
-    };
-    const TRUNCATED: Fixture = Fixture {
-        name: "truncated_stream",
-        script: TRUNCATED_SCRIPT,
-        thinking: ThinkingConfig::Off,
-    };
+}
 
-    /// Points every base directory at a throwaway tree and publishes the key
-    /// both sides resolve, so neither reads this machine's credentials,
-    /// `providers.toml` or saved origins.
-    fn isolated() -> TempDir {
-        let dir = TempDir::new().expect(TEMPDIR_FAILED);
-        for var in [
-            "HOME",
-            "XDG_STATE_HOME",
-            "XDG_CONFIG_HOME",
-            "XDG_DATA_HOME",
-            "XDG_CACHE_HOME",
-        ] {
-            unsafe { std::env::set_var(var, dir.path()) };
-        }
-        unsafe { std::env::set_var(ENV_VAR, API_KEY) };
-        dir
-    }
+/// Synthetic as [`decl`] puts it on the wire, one recorded exchange at a time.
+#[cfg(test)]
+mod tests {
+    use test_case::test_case;
 
-    /// The one door onto the recorded server that both sides go through.
-    ///
-    /// The base-url precedence is `auth.base_url` > `<SLUG>_BASE_URL` /
-    /// `providers.toml` > the static default, and only the middle rung is open
-    /// to both: the declaration's static `base_url` is the codec's *last*
-    /// resort, so writing loopback there would mean registering a declaration
-    /// that is not the one being ported, and `auth.base_url` is only ever
-    /// written by an auth hook, which a zero-hook declaration has none of.
-    fn point_at(base_url: &str) {
-        unsafe { std::env::set_var(BASE_URL_ENV, base_url) };
-    }
+    use crate::providers::replay::{self, Fixture};
 
-    /// The startup path rather than a hand-built registration: a load with no
-    /// plugin in it stages exactly the declarations maki authors, and
-    /// `create` resolves the *inherited* `api_key_env` into a key pool
-    /// eagerly, so the claim on the built-in slug is exercised instead of
-    /// assumed.
-    fn register_decl() {
-        plugin::begin_load();
-        plugin::commit_load();
-    }
+    use super::SLUG;
+    use super::fixtures;
 
-    /// The registry, the environment and the credential store are all
-    /// process-global; `cargo nextest` gives each case its own process, which
-    /// is what keeps one fixture's origin out of the next one's.
-    #[test_case(&SUCCESS ; "success")]
-    #[test_case(&UNAUTHORIZED ; "unauthorized")]
-    #[test_case(&SLOW_DOWN ; "rate_limited_with_retry_after")]
-    #[test_case(&RATE_LIMITED ; "rate_limited")]
-    #[test_case(&SERVER_ERROR ; "server_error")]
-    #[test_case(&MALFORMED ; "malformed_sse")]
-    #[test_case(&EMPTY_ERROR ; "empty_sse_error_frame")]
-    #[test_case(&TRUNCATED ; "truncated_stream")]
+    #[test_case(&fixtures::SUCCESS ; "success")]
+    #[test_case(&replay::UNAUTHORIZED ; "unauthorized")]
+    #[test_case(&replay::SLOW_DOWN ; "rate_limited_with_retry_after")]
+    #[test_case(&replay::RATE_LIMITED ; "rate_limited")]
+    #[test_case(&replay::SERVER_ERROR ; "server_error")]
+    #[test_case(&replay::MALFORMED_SSE ; "malformed_sse")]
+    #[test_case(&replay::EMPTY_SSE_ERROR ; "empty_sse_error_frame")]
+    #[test_case(&replay::TRUNCATED_STREAM ; "truncated_stream")]
     fn the_declaration_replays_the_recorded_exchange(fixture: &Fixture) {
-        let _isolated = isolated();
-        let model = Model::from_spec(MODEL_SPEC).expect(UNKNOWN_MODEL);
-        register_decl();
-
-        let declared = replay::run(fixture, &model, |base_url| {
-            point_at(base_url);
-            plugin::create(SLUG, Timeouts::default()).expect(CREATE_FAILED)
-        });
-        replay::assert_golden(SLUG, fixture, &declared);
+        replay::declared(replay::rust_authoring, SLUG, fixture, &fixtures::model());
     }
 }

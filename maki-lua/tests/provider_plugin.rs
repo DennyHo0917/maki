@@ -39,7 +39,10 @@ const LOOPBACK_HOST: &str = "127.0.0.1";
 const TOKEN_KEY: &str = "token";
 const ANON_TOKEN: &str = "anonymous";
 const RENEWED_TOKEN: &str = "anonymous-renewed";
-const RETRY_AFTER_SECONDS: u64 = 7;
+/// What the recorded server answers a rate limit with, and the same seconds
+/// the error is expected to carry back out. One literal, so the header and the
+/// expectation cannot drift apart.
+const RETRY_AFTER: &str = "7";
 
 /// Every plugin written inline loads under this one name, so loading a second
 /// source is a reload of the first.
@@ -60,6 +63,14 @@ const FREE_SLUG: &str = "acmefree";
 const STUCK_AFTER: Duration = Duration::from_secs(20);
 const RELOADED_SOURCE: &str = "-- the provider plugin, reloaded without its registration\n";
 
+/// A provider maki ships a declaration for, so the slug is both a built-in row
+/// and a decl already standing when the plugin below reaches for it.
+const BUILTIN_SLUG: &str = "deepseek";
+const BUILTIN_HOST: &str = "api.deepseek.com";
+const RESERVED_SLUG_MESSAGE: &str = "belongs to a built-in provider";
+const CLAIM_ALLOWED: &str = "a third-party plugin took a built-in slug";
+const BUILTIN_LOST: &str = "maki's own declaration must still serve the slug";
+
 const PROMPT: &str = "read a.txt";
 const SYSTEM: &str = "You are a test.";
 /// The `system_prefix` the fixture registers, which only reaches the wire if
@@ -68,7 +79,8 @@ const SYSTEM_PREFIX: &str = "Acme house rules: answer in full sentences.";
 const REMAPPED_MESSAGE: &str = "Acme allowance is spent until the next cycle";
 
 const HOST_FAILED: &str = "the plugin host did not start";
-const NEVER_PARKED: &str = "the login hook never parked";
+const HOOK_NEVER_SIGNALLED: &str = "the login hook never reached the point the test waits on";
+const BAD_RETRY_AFTER: &str = "the recorded retry-after is not a number of seconds";
 const HOOK_THREAD_FAILED: &str = "the thread running the login hook panicked";
 const LOAD_FAILED: &str = "the provider plugin did not load";
 const CREATE_FAILED: &str = "the registered provider could not be built";
@@ -116,8 +128,10 @@ const EXPIRED_TOKEN_BODY: &str = r#"{"error":{"message":"token expired"}}"#;
 const ALLOWANCE_BODY: &str = r#"{"error":{"message":"monthly allowance exhausted"}}"#;
 const OVERLOADED_BODY: &str = r#"{"error":{"message":"upstream is busy"}}"#;
 
-const SLOW_DOWN_HEADERS: &[(&str, &str)] =
-    &[("content-type", "application/json"), ("retry-after", "7")];
+const SLOW_DOWN_HEADERS: &[(&str, &str)] = &[
+    ("content-type", "application/json"),
+    ("retry-after", RETRY_AFTER),
+];
 
 const CHAT_SCRIPT: &[Canned] = &[Canned::sse(CHAT_TRANSCRIPT)];
 const RESPONSES_SCRIPT: &[Canned] = &[Canned::sse(RESPONSES_TRANSCRIPT)];
@@ -395,10 +409,8 @@ fn map_error_restates_the_status_and_keeps_retry_after(
     assert_eq!(*status, expected_status);
     assert_eq!(message, expected_message);
     assert_eq!(error.retry_kind(), expected_kind);
-    assert_eq!(
-        error.retry_after(),
-        Some(Duration::from_secs(RETRY_AFTER_SECONDS))
-    );
+    let asked_for = Duration::from_secs(RETRY_AFTER.parse().expect(BAD_RETRY_AFTER));
+    assert_eq!(error.retry_after(), Some(asked_for));
 }
 
 /// There is no `has_auth` flag: defining `login` is the whole of what makes a
@@ -508,10 +520,14 @@ fn write_credentials(entered: &Path, done: &Path) -> String {
     )
 }
 
+/// Waits on a file a Lua hook writes, which is the only line a hook running on
+/// the host's own thread can hand back to the test. Polling rather than timing:
+/// nothing here is expected to take a set amount of time, and the deadline only
+/// turns a hang into a failure the runner can report.
 fn wait_for(path: &Path) {
     let deadline = Instant::now() + STUCK_AFTER;
     while !path.exists() {
-        assert!(Instant::now() < deadline, "{NEVER_PARKED}");
+        assert!(Instant::now() < deadline, "{HOOK_NEVER_SIGNALLED}");
         std::thread::sleep(Duration::from_millis(PARKING_POLL_MS));
     }
 }
@@ -579,4 +595,35 @@ fn an_in_flight_hook_call_survives_a_plugin_reload() {
     std::fs::write(&release, "1").expect(IO_FAILED);
 
     login.join().expect(HOOK_THREAD_FAILED).expect(HOOK_FAILED);
+}
+
+/// A slug maki ships is maki's to declare, and a plugin from outside the
+/// binary may not take it. A decl that claims one inherits its `api_key_env`,
+/// so the key the user set for the built-in would be resolved into the
+/// claimant's credentials and handed straight to it by
+/// `maki.provider.auth.resolved`, under a name the picker still labels with
+/// the built-in's display name. No `net` grant and no host list ever bought
+/// that reach.
+#[test]
+fn a_third_party_plugin_cannot_take_a_builtin_slug() {
+    let _state = isolated_state();
+    let host = plugin_host();
+    // Stages the declarations maki authors, so the built-in is already standing
+    // when the plugin reaches for it, exactly as it would be at startup.
+    plugin::begin_load();
+
+    let error = host
+        .load_source_with_permissions(
+            INLINE_PLUGIN,
+            &format!(r#"maki.provider.register({{ slug = "{BUILTIN_SLUG}", codec = "openai" }})"#),
+            permissions_for(BUILTIN_HOST),
+        )
+        .expect_err(CLAIM_ALLOWED);
+    plugin::commit_load();
+
+    assert!(error.to_string().contains(RESERVED_SLUG_MESSAGE), "{error}");
+    assert!(
+        plugin::registered_decl(BUILTIN_SLUG) == plugin::rust_decl(BUILTIN_SLUG),
+        "{BUILTIN_LOST}"
+    );
 }

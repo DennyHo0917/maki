@@ -36,8 +36,8 @@ pub mod opencode;
 pub(crate) mod openrouter;
 pub mod plugin;
 pub(crate) mod regolo;
-#[cfg(test)]
-pub(crate) mod replay;
+#[cfg(any(test, feature = "test-support"))]
+pub mod replay;
 pub(crate) mod requesty;
 pub(crate) mod synthetic;
 pub(crate) mod tensorx;
@@ -430,6 +430,11 @@ impl KeyPool {
                 "{env_var} not set and no saved credentials for '{slug}' — run `maki auth login {slug}`"
             ),
         })
+    }
+
+    /// Whether both pools hold the same keys, whatever position each is at.
+    pub(crate) fn same_keys(&self, other: &Self) -> bool {
+        self.keys == other.keys
     }
 
     fn key_from_file(slug: &str) -> Option<String> {

@@ -463,7 +463,7 @@ fn parse_retry_after(value: &str) -> Option<Duration> {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashSet;
+    use std::{collections::HashSet, mem::discriminant};
 
     use maki_config::DEFAULT_MAX_RETRIES;
     use serde_json::{Value, json};
@@ -748,6 +748,8 @@ mod tests {
         assert_eq!(api_msg(400, message).overflow(), Some(expected));
     }
 
+    /// One sample per `AgentError` variant. A new variant means a new sample
+    /// in [`corpus`] and a bump here, or the corpus quietly stops covering it.
     const VARIANT_COUNT: usize = 11;
     /// One status per branch the answers below split on: refused for size
     /// (400, 413), stale token (401), dead key but live account (403), rate
@@ -763,24 +765,6 @@ mod tests {
     const TIMEOUT_SECS: u64 = 30;
     const INVALID_URI: &str = "http://[";
     const INVALID_JSON: &str = "{";
-
-    /// Adding a variant stops this compiling, which is the nudge to put a
-    /// sample of it in [`corpus`].
-    fn variant_index(error: &AgentError) -> usize {
-        match error {
-            AgentError::Api { .. } => 0,
-            AgentError::Config { .. } => 1,
-            AgentError::Tool { .. } => 2,
-            AgentError::Io(_) => 3,
-            AgentError::Http(_) => 4,
-            AgentError::HttpRequest(_) => 5,
-            AgentError::Json(_) => 6,
-            AgentError::Channel => 7,
-            AgentError::Cancelled => 8,
-            AgentError::Timeout { .. } => 9,
-            AgentError::EmptySummary => 10,
-        }
-    }
 
     /// Every variant, and for `Api` every wording and status the answers are
     /// known to turn on, crossed with both `Retry-After` shapes.
@@ -811,8 +795,11 @@ mod tests {
         // One kind on each side of the connect/transient split, plus the second
         // connect failure so the two that share a projection have to agree.
         corpus.extend(
-            [io::ErrorKind::ConnectionRefused, io::ErrorKind::UnexpectedEof]
-                .map(|kind| AgentError::Io(kind.into())),
+            [
+                io::ErrorKind::ConnectionRefused,
+                io::ErrorKind::UnexpectedEof,
+            ]
+            .map(|kind| AgentError::Io(kind.into())),
         );
         corpus.extend(
             [
@@ -878,25 +865,32 @@ mod tests {
     fn equal_projections_agree_on_every_observable() {
         let mut seen: Vec<(ErrorProjection, Observables)> = Vec::new();
         let mut variants = HashSet::new();
-        let mut collisions = 0usize;
+        let mut shared_projections = false;
 
         for error in corpus() {
-            variants.insert(variant_index(&error));
+            variants.insert(discriminant(&error));
             let projection = error.projection();
             let observed = Observables::of(&error);
             match seen.iter().position(|(p, _)| *p == projection) {
                 Some(twin) => {
-                    collisions += 1;
-                    assert_eq!(seen[twin].1, observed, "{error:?} projects to {projection:?}");
+                    shared_projections = true;
+                    assert_eq!(
+                        seen[twin].1, observed,
+                        "{error:?} projects to {projection:?}"
+                    );
                 }
                 None => seen.push((projection, observed)),
             }
         }
 
-        assert_eq!(variants.len(), VARIANT_COUNT, "the corpus skipped a variant");
+        assert_eq!(
+            variants.len(),
+            VARIANT_COUNT,
+            "the corpus skipped a variant"
+        );
         // All-distinct projections would pass without proving a thing.
         assert!(
-            collisions > 0,
+            shared_projections,
             "the corpus needs errors that differ below the projection"
         );
     }

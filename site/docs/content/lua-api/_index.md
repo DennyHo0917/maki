@@ -3659,9 +3659,12 @@ any other provider's: they appear in the model picker, in `/model`, and in
 `providers.toml` overrides, addressed as `<slug>/<model>`.
 
 The plugin must declare the hosts it talks to as `net_hosts` under
-`[permissions]` in its `plugin.toml`. That list is the only set of origins
-maki will send this provider's credentials to, whatever a hook returns
-later. Registering with no declared host fails.
+`[permissions]` in its `plugin.toml`. That list is what maki will send this
+provider's credentials to, whatever a hook returns later. The one origin it
+need not name is the one the user chose: a slug pointed at a gateway with
+`<SLUG>_BASE_URL` or `providers.toml` is reachable from this provider's
+hooks, since its requests already go there. Registering with no declared
+host fails.
 
 Give exactly one of `codec` (speak a wire protocol maki already knows) or
 `base` (borrow a native provider whole, including its quirks and its model
@@ -3679,22 +3682,28 @@ ignored at request time: `build_body` needs one of the `openai` codecs, and
 
 {spec} fields:
   `slug` (string) Required. How the provider is addressed: `<slug>/<model>`.
-          Letters, digits, `_` and `-`, starting with a letter or digit, and
-          not a slug `providers.toml` already owns. A built-in slug may be
-          claimed: the decl then inherits `display_name`, `api_key_env`,
-          the curated model table and pricing from the built-in, so
-          restating any of those is an error rather than an override.
-  `display_name` (string) Required, except for a decl claiming a built-in
-          slug. Shown in the UI.
+          Letters, digits, `_` and `-`, starting with a letter or digit,
+          and neither a slug `providers.toml` already owns nor one of a
+          built-in provider. A built-in slug is reserved: claiming it
+          inherits that provider's `api_key_env`, which would hand a plugin
+          the key the user set for the built-in. Only the plugins maki
+          ships inside the binary may take one, and they inherit
+          `display_name`, `api_key_env`, the curated model table and its
+          pricing, so restating any of those is an error rather than an
+          override.
+  `display_name` (string) Required. Shown in the UI.
   `codec` (string) `"openai"`, `"openai-responses"`, `"anthropic"` or
           `"google"`. Mutually exclusive with `base`.
   `base` (string) A native provider slug to build on, e.g. `"anthropic"`.
-  `base_url` (string) Last-resort origin for requests: `<SLUG>_BASE_URL`
-          and `providers.toml` both outrank it, and an origin an auth hook
-          returns outranks those. Its host must be one of the declared
-          `net_hosts`, and it must be `https` unless it points at loopback.
-  `api_key_env` (string) Environment variable holding an API key. Read at
-          registration and sent as a bearer token when set.
+  `base_url` (string) Fallback origin for requests. `<SLUG>_BASE_URL` and
+          `providers.toml` outrank it, and an origin an auth hook returns
+          outranks those. Its host must be one of the declared `net_hosts`,
+          and it must be `https` unless it points at loopback.
+  `api_key_env` (string) Environment variable holding an API key, sent as a
+          bearer token when set. Needs the `env` permission: resolving it
+          reads the environment, and the key saved for the slug.
+          Re-read every time maki builds the provider, so a key set or
+          replaced since is picked up.
   `system_prefix` (string) Text prepended to the system prompt.
   `max_tokens_field` (string) Body field carrying the output cap. Defaults
           to `max_tokens`.
@@ -3724,9 +3733,14 @@ ignored at request time: `build_body` needs one of the `openai` codecs, and
            broken is still listed and fails when it is used. `purpose` is
            `"resolve"`. Omitting `base_url` keeps the one in force.
   `refresh_auth` (function) Same shape, called after a 401 with
-           `purpose = "refresh"`. Falls back to `resolve_auth`.
+           `purpose = "refresh"`.
   `reload_auth` (function) Same shape, called with `purpose = "reload"` to
-           re-read what a `login` wrote. Falls back to `resolve_auth`.
+           re-read what a `login` wrote.
+           The three are one hook with three entry points: a purpose runs
+           the entry named for it, and falls back to the first of the three
+           the plugin supplied. Writing only `resolve_auth` therefore
+           serves all three, which is right for a plugin that reads its
+           credentials fresh every time.
   `list_models` (function) `function()` returning a list of model rows,
            for a provider whose catalogue is only known at runtime. Rows
            carry `id`, `context_window`, `max_output_tokens`, `pricing`,
@@ -3785,11 +3799,16 @@ while a refresh writes.
 The stored value is a free-form JSON object. maki owns where it lives
 and who may read it, the plugin owns what is in it.
 
+`resolved` is the other direction: not what the plugin wrote, but the
+credentials and origin maki resolved for the slug and sends on every
+request to it.
+
 A plugin can only reach slugs it registered itself.
 
 ```lua
 maki.provider.auth.set("acme", { access_token = tok, expires = when })
 local creds = maki.provider.auth.get("acme")
+local auth = maki.provider.auth.resolved("acme")
 maki.provider.auth.clear("acme")
 ```
 
@@ -3870,6 +3889,48 @@ Forget the credentials stored for one of this plugin's providers.
 
 ```lua
 maki.provider.auth.clear("acme")
+```
+
+---
+
+### `maki.provider.auth.resolved()` {#maki-provider-auth-resolved}
+
+```lua
+maki.provider.auth.resolved({slug})
+```
+
+Read the live credentials and effective origin of one of this plugin's
+providers.
+
+For a hook that has to reach an endpoint the codec knows nothing about, a
+balance or a quota url, and so needs exactly what every request to the slug
+already carries. `headers` holds whatever maki resolved for it: the bearer
+token from the declared `api_key_env`, whatever `resolve_auth` returned, and
+any `[<slug>.headers]` from `providers.toml`. `base_url` is the origin a
+request would reach right now, resolved the way the codec resolves it: an
+auth-supplied origin, then `<SLUG>_BASE_URL` or `providers.toml`, then the
+declared `base_url`. Hard-coding an origin instead would send the call
+somewhere else than the rest of the provider whenever a user points the slug
+at a gateway.
+
+This hands over live credentials, which is why it only answers for the
+providers the calling plugin declared. A snapshot, like the one every
+request takes, so a refresh landing mid-call cannot swap the headers a hook
+is already building a request from.
+
+**Parameters:**
+
+- `{slug}` (`string`) A provider slug this plugin registered.
+
+**Returns:** (`table?`, `string?`) `{ base_url = ..., headers = { ... } }`, or
+  `(nil, err)` on failure.
+
+**Example:**
+
+```lua
+local auth, err = maki.provider.auth.resolved("acme")
+if not auth then return end
+local res = maki.net.request(auth.base_url .. "/usage", { headers = auth.headers })
 ```
 
 

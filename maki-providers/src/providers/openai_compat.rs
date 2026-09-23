@@ -206,6 +206,10 @@ impl OpenAiCompatProvider {
         )
     }
 
+    /// Where a provider's own headers meet the credentials. A header already on
+    /// the request wins: no denylist could say which headers carry a
+    /// credential (`x-api-key`, `api-key`, `x-goog-api-key`, ...), so whatever
+    /// the auth layer wrote stays, key rotation included.
     pub async fn do_stream(
         &self,
         model: &crate::model::Model,
@@ -219,6 +223,13 @@ impl OpenAiCompatProvider {
             .build_request("POST", "/chat/completions", auth)
             .header("content-type", "application/json");
         for &(key, value) in extra_headers {
+            if request
+                .headers_ref()
+                .is_some_and(|set| set.contains_key(key))
+            {
+                debug!(header = key, "kept the header already on the request");
+                continue;
+            }
             request = request.header(key, value);
         }
 

@@ -11,7 +11,7 @@ use maki_config::providers::{
 use maki_storage::StateDir;
 use maki_storage::auth::lock_credentials;
 use maki_storage::id::SessionRef;
-use serde::{Deserialize, Serialize, Serializer};
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tracing::{debug, warn};
 use url::{Host, Url};
@@ -21,16 +21,18 @@ use crate::model::{
 };
 use crate::provider::{BoxFuture, Provider};
 use crate::spec::{ProviderRegistry, ProviderSpec};
-use crate::types::{EffortDialect, ThinkingFields, dialect};
+use crate::types::ThinkingFields;
 use crate::{AgentError, Message, ProviderEvent, ProviderUsage, RequestOptions, StreamResponse};
 
-use super::codec::{self, BodyHook, CodecOptions};
+use super::codec::{self, BodyHook, CodecOptions, RequestCtx};
+pub use super::codec::{EffortField, OpenAiWire, SessionCarrier, ThinkingWire};
 use super::{KeyHeader, KeyPool, KeyRotation, ResolvedAuth, Timeouts, deepseek, synthetic};
 
 const DEFAULT_MAX_OUTPUT_TOKENS: u32 = 16384;
 const DEFAULT_CONTEXT_WINDOW: u32 = 128_000;
 const BUILD_BODY_OPTION: &str = "build_body hook";
 const SYSTEM_PREFIX_OPTION: &str = "system_prefix";
+const OPENAI_OPTION: &str = "openai";
 const DISPLAY_NAME_FIELD: &str = "display_name";
 const API_KEY_ENV_FIELD: &str = "api_key_env";
 const MODELS_FIELD: &str = "models";
@@ -146,6 +148,7 @@ fn is_loopback(url: &Url) -> bool {
 /// defaults included, so a row survives a round trip and two spellings of the
 /// same provider compare equal whichever way they were authored.
 #[derive(Clone, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct PluginModel {
     /// Every id this row answers for. `prefixes[0]` is the canonical id,
     /// used wherever a concrete model has to be named.
@@ -242,7 +245,12 @@ fn default_context_window() -> u32 {
 /// `PartialEq` and not `Eq` because a declared [`ModelPricing`] is four `f64`
 /// rates. Comparing them bitwise is exactly the question being asked: two
 /// decls state the same rate or they do not.
-#[derive(Clone, PartialEq, Serialize)]
+///
+/// Decoded by serde straight off the authoring surface, and a key it does not
+/// know is an error: a typo'd option would otherwise be an option silently
+/// left out.
+#[derive(Clone, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct ProviderDecl {
     pub slug: String,
     /// `None` only for a decl that claims a built-in slug, which inherits the
@@ -256,28 +264,16 @@ pub struct ProviderDecl {
     pub base_url: Option<String>,
     pub api_key_env: Option<String>,
     pub system_prefix: Option<String>,
-    /// `None` means `max_tokens`, see [`CodecOptions::max_tokens_field`].
-    pub max_tokens_field: Option<String>,
-    /// `None` asks for streamed usage, see
-    /// [`CodecOptions::include_stream_usage`].
-    pub include_stream_usage: Option<bool>,
-    /// How this provider's API spells reasoning effort, when it has a word of
-    /// its own for it.
-    #[serde(serialize_with = "serialize_dialect")]
-    pub thinking_dialect: Option<&'static EffortDialect<'static>>,
+    #[serde(default)]
     pub models: Vec<PluginModel>,
+    /// Only for `codec = "openai"`: grouped under the codec that honours them,
+    /// so one rule refuses every option a different target would ignore.
+    pub openai: Option<OpenAiWire>,
+    /// Never written by the author: a Lua plugin's come from its
+    /// `plugin.toml`, where the permission to reach them is granted. Still
+    /// dumped, because two decls are compared on it too.
+    #[serde(skip_deserializing)]
     pub net_hosts: Vec<String>,
-}
-
-/// Dumped as the dialect's name, so the table stays the one source of truth
-/// for what a dialect is and a decl never carries the name twice.
-fn serialize_dialect<S: Serializer>(
-    thinking_dialect: &Option<&'static EffortDialect<'static>>,
-    serializer: S,
-) -> Result<S::Ok, S::Error> {
-    thinking_dialect
-        .and_then(dialect::name_of)
-        .serialize(serializer)
 }
 
 /// A declaration plus the callbacks that go with it. The split is the point:
@@ -355,12 +351,6 @@ pub enum RegisterError {
         "provider '{slug}': {field} is inherited from the built-in provider of the same name and must not be restated"
     )]
     Restated { slug: String, field: &'static str },
-    #[error("provider '{slug}': unknown thinking dialect '{name}' (expected one of {expected})")]
-    UnknownDialect {
-        slug: String,
-        name: String,
-        expected: String,
-    },
     #[error("provider '{0}' must set exactly one of `codec` or `base`")]
     CodecOrBase(String),
     #[error("provider '{slug}': base '{base}' is not a native provider")]
@@ -377,19 +367,6 @@ pub enum RegisterError {
         option: &'static str,
         target: String,
     },
-}
-
-/// Looks a dialect up by name, for authoring surfaces that carry names rather
-/// than Rust consts.
-pub fn thinking_dialect(
-    slug: &str,
-    name: &str,
-) -> Result<&'static EffortDialect<'static>, RegisterError> {
-    dialect::by_name(name).ok_or_else(|| RegisterError::UnknownDialect {
-        slug: slug.to_string(),
-        name: name.to_string(),
-        expected: dialect::NAMES.join(", "),
-    })
 }
 
 /// What a registered slug builds its requests with. Exactly one of the two, so
@@ -427,6 +404,17 @@ fn honours_build_body(target: Target) -> bool {
     match target {
         Target::Codec(Protocol::Openai | Protocol::OpenaiResponses) => true,
         Target::Codec(Protocol::Anthropic | Protocol::Google) | Target::Base(_) => false,
+    }
+}
+
+/// The `openai` table is the chat codec's own vocabulary. The responses codec
+/// spells neither effort nor extra body the same way, so it is refused there
+/// rather than half honoured.
+fn honours_openai_wire(target: Target) -> bool {
+    match target {
+        Target::Codec(Protocol::Openai) => true,
+        Target::Codec(Protocol::OpenaiResponses | Protocol::Anthropic | Protocol::Google)
+        | Target::Base(_) => false,
     }
 }
 
@@ -781,6 +769,9 @@ fn target_of(decl: &ProviderDecl, hooks: &ProviderHooks) -> Result<Target, Regis
     }
     if decl.system_prefix.is_some() && !honours_system_prefix(target) {
         return Err(unsupported(SYSTEM_PREFIX_OPTION));
+    }
+    if decl.openai.is_some() && !honours_openai_wire(target) {
+        return Err(unsupported(OPENAI_OPTION));
     }
     Ok(target)
 }
@@ -1208,13 +1199,12 @@ impl BodyHook for BodyAdapter {
     fn call<'a>(
         &'a self,
         body: Value,
-        model: &'a Model,
-        opts: RequestOptions,
+        ctx: &RequestCtx<'_>,
     ) -> BoxFuture<'a, Result<Value, AgentError>> {
         self.0.call(BodyInput {
             body,
-            model: model.id.clone(),
-            thinking: opts.thinking.to_string(),
+            model: ctx.model.id.clone(),
+            thinking: ctx.opts.thinking.to_string(),
         })
     }
 }
@@ -1295,6 +1285,7 @@ impl PluginProvider {
     }
 }
 
+#[warn(clippy::missing_trait_methods)]
 impl Provider for PluginProvider {
     fn stream_message<'a>(
         &'a self,
@@ -1404,6 +1395,12 @@ impl Provider for PluginProvider {
             KeyHeader::Bearer,
         ))
     }
+
+    /// Whatever the target knows about its models, a `base`'s own rules
+    /// included, still applies under a declaration that wraps it.
+    fn adjust_model(&self, model: &mut Model) {
+        self.inner.adjust_model(model);
+    }
 }
 
 /// Builds from registry data alone: no hook runs here, because this is called
@@ -1450,11 +1447,9 @@ fn codec_options(entry: &PluginEntry, protocol: Protocol) -> CodecOptions {
     CodecOptions {
         api_key_env: decl.api_key_env.clone().unwrap_or_default().into(),
         base_url: decl.base_url.clone().unwrap_or_default().into(),
-        max_tokens_field: decl.max_tokens_field.clone().map(Into::into),
-        include_stream_usage: decl.include_stream_usage,
         provider_name: entry.display_name().to_owned().into(),
         system_prefix: decl.system_prefix.clone(),
-        thinking_dialect: decl.thinking_dialect,
+        openai: decl.openai.clone().unwrap_or_default(),
         build_body: entry
             .hooks
             .build_body
@@ -1644,6 +1639,7 @@ mod tests {
     use super::*;
     use crate::retry::RetryKind;
     use crate::test_support::{Canned, serve};
+    use crate::types::dialect;
 
     const AUTH_HEADER: &str = "authorization";
     const CONSTANT_TOKEN: &str = "Bearer constant";
@@ -1693,9 +1689,7 @@ mod tests {
             base_url: Some(EXAMPLE_BASE_URL.to_string()),
             api_key_env: None,
             system_prefix: None,
-            max_tokens_field: None,
-            include_stream_usage: None,
-            thinking_dialect: None,
+            openai: None,
             models: vec![
                 serde_json::from_value(serde_json::json!({
                     "prefixes": [MODEL_ID, MODEL_ALIAS],
@@ -2229,19 +2223,34 @@ mod tests {
     /// from rather than storing it twice.
     #[test]
     fn a_dialect_is_resolved_by_name() {
-        const SLUG: &str = "dialect-plugin";
         const KNOWN: &str = "deepseek";
         const UNKNOWN: &str = "not-a-dialect";
-        let resolved = thinking_dialect(SLUG, KNOWN).unwrap();
-        assert_eq!(resolved, &dialect::DEEPSEEK);
+        let authored = |name: &str| {
+            serde_json::json!({
+                "slug": "dialect-plugin",
+                "codec": "openai",
+                "openai": { "thinking": { "dialect": name } },
+            })
+        };
 
-        let error = thinking_dialect(SLUG, UNKNOWN).unwrap_err().to_string();
+        let decl: ProviderDecl = serde_json::from_value(authored(KNOWN)).unwrap();
+        let thinking = decl.openai.as_ref().and_then(|wire| wire.thinking.as_ref());
+        assert_eq!(
+            thinking.map(|thinking| thinking.dialect),
+            Some(&dialect::DEEPSEEK)
+        );
+
+        let error = serde_json::from_value::<ProviderDecl>(authored(UNKNOWN))
+            .err()
+            .map(|e| e.to_string())
+            .unwrap_or_default();
         assert!(error.contains(UNKNOWN) && error.contains(KNOWN), "{error}");
 
-        let mut decl = decl(SLUG);
-        decl.thinking_dialect = Some(resolved);
         let dumped = serde_json::to_value(&decl).unwrap();
-        assert_eq!(dumped["thinking_dialect"], serde_json::json!(KNOWN));
+        assert_eq!(
+            dumped["openai"]["thinking"]["dialect"],
+            serde_json::json!(KNOWN)
+        );
     }
 
     /// A decl that claims a built-in slug: it states only what the spec row
@@ -2308,6 +2317,12 @@ mod tests {
         reg.hooks.build_body = Some(Arc::new(PanicHook));
     }
 
+    /// The table the chat codec reads, on a codec that would read none of it.
+    fn openai_wire_on_anthropic(reg: &mut Registration) {
+        reg.decl.codec = Some(Protocol::Anthropic);
+        reg.decl.openai = Some(OpenAiWire::default());
+    }
+
     fn system_prefix_on_google(reg: &mut Registration) {
         reg.decl.codec = Some(Protocol::Google);
         reg.decl.system_prefix = Some(SOME_SYSTEM_PREFIX.to_string());
@@ -2346,6 +2361,7 @@ mod tests {
     #[test_case(no_net_hosts, |e| matches!(e, RegisterError::NoNetHosts(_)) ; "net_hosts_empty")]
     #[test_case(outside_a_load, |e| matches!(e, RegisterError::Closed(_)) ; "registration_outside_a_load")]
     #[test_case(body_hook_on_anthropic, |e| matches!(e, RegisterError::Unsupported { .. }) ; "build_body_needs_an_openai_codec")]
+    #[test_case(openai_wire_on_anthropic, |e| matches!(e, RegisterError::Unsupported { option, .. } if *option == OPENAI_OPTION) ; "openai_table_needs_the_openai_codec")]
     #[test_case(system_prefix_on_google, |e| matches!(e, RegisterError::Unsupported { .. }) ; "google_drops_the_system_prefix")]
     #[test_case(system_prefix_on_the_google_base, |e| matches!(e, RegisterError::Unsupported { .. }) ; "so_does_the_google_base")]
     #[test_case(base_url_off_the_declared_hosts, |e| matches!(e, RegisterError::UndeclaredBaseUrl(_)) ; "base_url_must_be_declared")]

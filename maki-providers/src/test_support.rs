@@ -21,15 +21,29 @@ const CONTENT_LENGTH: &str = "content-length";
 const AUTHORIZATION: &str = "authorization";
 const BIND_FAILED: &str = "cannot bind loopback";
 const IO_FAILED: &str = "the recorded connection broke";
+const QUERY_START: char = '?';
+const MIXED_SCRIPT: &str =
+    "a script is either all routed with `Canned::at` or all sequential, never a mix";
+
+/// The answer to a routed request no entry is left for. It is written and
+/// recorded rather than dropped, so a stray request shows up in the
+/// observation instead of hanging the client.
+const NO_ROUTE: Canned = Canned::json(
+    404,
+    r#"{"error":{"message":"no canned answer for this path"}}"#,
+);
 
 pub const SSE_HEADERS: &[(&str, &str)] = &[("content-type", "text/event-stream")];
 pub const JSON_HEADERS: &[(&str, &str)] = &[("content-type", "application/json")];
 
-/// One recorded response, replayed in script order.
+/// One recorded response, replayed in script order unless it is routed.
 pub struct Canned {
     pub status: u16,
     pub headers: &'static [(&'static str, &'static str)],
     pub body: &'static str,
+    /// `Some` serves this answer to the first request for this path, whatever
+    /// order it arrives in. Set through [`Canned::at`].
+    pub path: Option<&'static str>,
 }
 
 impl Canned {
@@ -38,6 +52,7 @@ impl Canned {
             status: 200,
             headers: SSE_HEADERS,
             body,
+            path: None,
         }
     }
 
@@ -46,8 +61,29 @@ impl Canned {
             status,
             headers: JSON_HEADERS,
             body,
+            path: None,
         }
     }
+
+    /// `answer`, served to the request for `path` instead of in script order.
+    /// For a provider that fires requests concurrently, where arrival order is
+    /// a race and a sequential script would hand each one the other's answer.
+    ///
+    /// `path` is matched against the request path with its query string cut,
+    /// so a query carrying today's date still routes. Two entries for one path
+    /// are served in script order.
+    pub const fn at(path: &'static str, answer: Canned) -> Self {
+        Self {
+            path: Some(path),
+            ..answer
+        }
+    }
+}
+
+/// Whether `script` routes by path. [`serve`] has already rejected a mix, so
+/// the first entry speaks for all of them.
+pub fn is_routed(script: &[Canned]) -> bool {
+    script.first().is_some_and(|canned| canned.path.is_some())
 }
 
 /// What the client actually put on the wire, before anything parsed it.
@@ -77,27 +113,53 @@ impl Recorded {
 /// already here.
 pub type Requests = Arc<Mutex<Vec<Recorded>>>;
 
-/// Serves `script` in order on loopback, one connection per entry.
+/// Serves `script` on loopback, one connection per entry: in order, or by
+/// path when every entry is routed. Panics on a script that mixes the two,
+/// since which entry a request drew would then depend on the race routing
+/// exists to remove.
 ///
 /// The log is shared rather than joined and the server thread is detached: a
 /// script is an upper bound on what a run sends, and a caller replaying one
 /// script through two providers has to be able to read what the shorter of
 /// them sent without parking forever on an `accept` that will never return.
 pub fn serve(script: &'static [Canned]) -> (String, Requests) {
+    let routed = is_routed(script);
+    assert!(
+        script.iter().all(|canned| canned.path.is_some() == routed),
+        "{MIXED_SCRIPT}"
+    );
     let listener = TcpListener::bind(LOOPBACK).expect(BIND_FAILED);
     let base_url = format!("http://{}/v1", listener.local_addr().expect(BIND_FAILED));
     let requests = Requests::default();
     let log = Arc::clone(&requests);
     std::thread::spawn(move || {
-        for canned in script {
+        let mut served = vec![false; script.len()];
+        for next in 0..script.len() {
             let Ok((stream, _)) = listener.accept() else {
                 return;
             };
-            log.lock().unwrap().push(read_request(&stream));
-            write_canned(&stream, canned);
+            let request = read_request(&stream);
+            let answer = if routed {
+                route(script, &mut served, &request.path)
+            } else {
+                &script[next]
+            };
+            log.lock().unwrap().push(request);
+            write_canned(&stream, answer);
         }
     });
     (base_url, requests)
+}
+
+fn route<'s>(script: &'s [Canned], served: &mut [bool], path: &str) -> &'s Canned {
+    let path = path.split(QUERY_START).next().unwrap_or_default();
+    let Some(index) =
+        (0..script.len()).find(|&index| !served[index] && script[index].path == Some(path))
+    else {
+        return &NO_ROUTE;
+    };
+    served[index] = true;
+    &script[index]
 }
 
 fn read_request(stream: &TcpStream) -> Recorded {
@@ -148,4 +210,72 @@ fn write_canned(mut stream: &TcpStream, canned: &Canned) {
     response.push_str(canned.body);
     stream.write_all(response.as_bytes()).expect(IO_FAILED);
     stream.flush().expect(IO_FAILED);
+}
+
+#[cfg(test)]
+mod tests {
+    use std::panic::catch_unwind;
+
+    use test_case::test_case;
+
+    use super::*;
+
+    const A_PATH: &str = "/v1/a";
+    const B_PATH: &str = "/v1/b";
+    const A_BODY: &str = r#"{"route":"a"}"#;
+    const B_BODY: &str = r#"{"route":"b"}"#;
+    const ROUTED: &[Canned] = &[
+        Canned::at(B_PATH, Canned::json(200, B_BODY)),
+        Canned::at(A_PATH, Canned::json(200, A_BODY)),
+    ];
+    const MIXED: &[Canned] = &[
+        Canned::at(A_PATH, Canned::json(200, A_BODY)),
+        Canned::json(200, B_BODY),
+    ];
+
+    /// One raw request on its own connection, answered by the status line and
+    /// the body.
+    fn fetch(base_url: &str, path: &str) -> (String, String) {
+        let authority = base_url
+            .trim_start_matches("http://")
+            .split('/')
+            .next()
+            .unwrap();
+        let mut stream = TcpStream::connect(authority).unwrap();
+        write!(
+            stream,
+            "GET {path} HTTP/1.1\r\nhost: {authority}\r\n{CONTENT_LENGTH}: 0\r\n\r\n"
+        )
+        .unwrap();
+        let mut response = String::new();
+        stream.read_to_string(&mut response).unwrap();
+        let (head, body) = response.split_once("\r\n\r\n").unwrap();
+        let status = head.lines().next().unwrap().to_owned();
+        (status, body.to_owned())
+    }
+
+    #[test_case(A_PATH, A_BODY ; "plain_path")]
+    #[test_case("/v1/a?start_date=2026-09-23", A_BODY ; "query_is_cut")]
+    fn routed_script_answers_by_path_not_order(path: &str, expected: &str) {
+        let (base_url, requests) = serve(ROUTED);
+        assert_eq!(fetch(&base_url, path).1, expected);
+        assert_eq!(fetch(&base_url, B_PATH).1, B_BODY);
+        assert_eq!(requests.lock().unwrap()[0].path, path);
+    }
+
+    #[test]
+    fn unrouted_path_is_answered_and_recorded() {
+        const STRAY: &str = "/v1/stray";
+        let (base_url, requests) = serve(ROUTED);
+        let (status, body) = fetch(&base_url, STRAY);
+        assert!(status.contains(&NO_ROUTE.status.to_string()));
+        assert_eq!(body, NO_ROUTE.body);
+        assert_eq!(requests.lock().unwrap()[0].path, STRAY);
+    }
+
+    #[test]
+    fn mixed_script_is_rejected() {
+        let payload = catch_unwind(|| serve(MIXED)).err().unwrap();
+        assert_eq!(payload.downcast_ref::<String>().unwrap(), MIXED_SCRIPT);
+    }
 }

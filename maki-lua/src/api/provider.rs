@@ -7,13 +7,12 @@ use std::sync::atomic::AtomicBool;
 use std::time::{Duration, Instant};
 
 use maki_agent::cancel::CancelToken;
-use maki_config::providers::Protocol;
 use maki_lua_macro::{lua_fn, lua_table};
+use maki_providers::AgentError;
 use maki_providers::plugin::{
-    self, DeclAuthority, Hook, PluginModel, ProviderDecl, ProviderHooks, Registered, Registration,
+    self, DeclAuthority, Hook, ProviderDecl, ProviderHooks, Registered, Registration,
 };
 use maki_providers::provider::BoxFuture;
-use maki_providers::{AgentError, EffortDialect};
 use maki_storage::StateDir;
 use maki_storage::auth::{
     delete_plugin_auth, load_plugin_auth, lock_credentials, save_plugin_auth,
@@ -49,17 +48,7 @@ const FETCH_USAGE: &str = "fetch_usage";
 const LOGIN: &str = "login";
 const LOGOUT: &str = "logout";
 
-const SLUG: &str = "slug";
-const DISPLAY_NAME: &str = "display_name";
-const CODEC: &str = "codec";
-const BASE: &str = "base";
 const BASE_URL: &str = "base_url";
-const API_KEY_ENV: &str = "api_key_env";
-const SYSTEM_PREFIX: &str = "system_prefix";
-const MAX_TOKENS_FIELD: &str = "max_tokens_field";
-const INCLUDE_STREAM_USAGE: &str = "include_stream_usage";
-const THINKING_DIALECT: &str = "thinking_dialect";
-const MODELS: &str = "models";
 const HEADERS: &str = "headers";
 
 const BODY_FIELD: &str = "body";
@@ -511,8 +500,9 @@ fn owned(slugs: &OwnedSlugs, slug: &str) -> LuaResult<()> {
 /// `maki.net`, `maki.fs` and the rest of the API.
 ///
 /// An option the target cannot honour fails at registration rather than being
-/// ignored at request time: `build_body` needs one of the `openai` codecs, and
-/// `system_prefix` is refused by the `google` codec, which drops it.
+/// ignored at request time: `build_body` needs one of the `openai` codecs, the
+/// `openai` table needs `codec = "openai"`, and `system_prefix` is refused by
+/// the `google` codec, which drops it. So does a key this list does not name.
 ///
 /// {spec} fields:
 ///   `slug` (string) Required. How the provider is addressed: `<slug>/<model>`.
@@ -539,15 +529,34 @@ fn owned(slugs: &OwnedSlugs, slug: &str) -> LuaResult<()> {
 ///           Re-read every time maki builds the provider, so a key set or
 ///           replaced since is picked up.
 ///   `system_prefix` (string) Text prepended to the system prompt.
-///   `max_tokens_field` (string) Body field carrying the output cap. Defaults
-///           to `max_tokens`.
-///   `include_stream_usage` (boolean) Whether to ask for usage on the stream.
-///           Defaults to `true`.
-///   `thinking_dialect` (string) Names the provider's effort dialect, one of
-///           `"standard"`, `"codex"`, `"codex-5-1"`, `"coding-plan"`,
-///           `"gpt-5-6"`, `"gpt-6"`, `"prefer-high"`, `"high-only"`, `"glm"`,
-///           `"deepseek"`, `"anthropic-adaptive"`, `"tensorx"`, `"grok"` or
-///           `"ollama"`. Omitting it sends no effort field.
+///   `openai` (table) How the `openai` codec speaks to this provider. Every
+///           key is optional:
+///     `max_tokens_field` (string) Body field carrying the output cap.
+///             Defaults to `max_tokens`.
+///     `include_stream_usage` (boolean) Whether to ask for usage on the
+///             stream. Defaults to `true`.
+///     `thinking` (table) How the API spells reasoning effort. Omitting it
+///             leaves effort to each model's `thinking_fields`.
+///       `dialect` (string) Required. The provider's effort dialect, one of
+///               `"standard"`, `"codex"`, `"codex-5-1"`, `"coding-plan"`,
+///               `"gpt-5-6"`, `"gpt-6"`, `"prefer-high"`, `"high-only"`,
+///               `"glm"`, `"deepseek"`, `"anthropic-adaptive"`, `"tensorx"`,
+///               `"grok"` or `"ollama"`.
+///       `field` (string) Where the effort goes in the body. A dotted path
+///               nests, e.g. `"reasoning.effort"`. Defaults to
+///               `reasoning_effort`.
+///       `requires_support` (boolean) Send effort only to models that
+///               support thinking. Defaults to `false`.
+///     `headers` (table) Header name to value, sent with every request. A
+///             header the credentials already set keeps its value, and
+///             `host`, `content-length`, `transfer-encoding` and `connection`
+///             are refused.
+///     `extra_body` (table) Merged into every request body.
+///     `session_id` (table) Sends the session id, as
+///             `{ header = "x-affinity" }` or `{ body_field = "session_id" }`.
+///     `thinking_overrides` (table) Model id prefix to `"no"`, `"yes"` or
+///             `"required"`, overriding what the model table says about
+///             thinking. The longest matching prefix wins.
 ///   `models` (table) List of model rows. Each row has `prefixes` (list): the
 ///            row answers for every model id starting with one of them,
 ///            longest prefix first, and `prefixes[1]` is the canonical id.
@@ -622,22 +631,22 @@ fn register(
     #[ctx] reads_env: bool,
     spec: Table,
 ) -> LuaResult<()> {
-    let api_key_env = optional(&spec, API_KEY_ENV)?;
-    if api_key_env.is_some() && !reads_env {
+    let (hook_keys, mut decl) = declaration(lua, &spec)?;
+    if decl.api_key_env.is_some() && !reads_env {
         return Err(register_error(API_KEY_ENV_NEEDS_ENV));
     }
-    let net_hosts = egress
+    decl.net_hosts = egress
         .declared()
         .as_deref()
         .filter(|hosts| !hosts.is_empty())
         .ok_or_else(|| register_error(NO_NET_HOSTS))?
         .to_vec();
-    let slug: String = field(&spec, SLUG)?;
+    let slug = decl.slug.clone();
     let (requests, release) = host_senders(lua)?;
     let keys = Arc::new(LuaHookKeys {
         plugin: Arc::clone(&plugin),
         slug: slug.clone(),
-        keys: hook_keys(lua, &spec)?,
+        keys: hook_keys,
         requests,
         release,
     });
@@ -645,20 +654,7 @@ fn register(
     let registered = plugin::register_plugin(
         plugin,
         Registration {
-            decl: ProviderDecl {
-                slug: slug.clone(),
-                display_name: optional(&spec, DISPLAY_NAME)?,
-                codec: codec(&spec)?,
-                base: optional(&spec, BASE)?,
-                base_url: optional(&spec, BASE_URL)?,
-                api_key_env,
-                system_prefix: optional(&spec, SYSTEM_PREFIX)?,
-                max_tokens_field: optional(&spec, MAX_TOKENS_FIELD)?,
-                include_stream_usage: optional_bool(&spec, INCLUDE_STREAM_USAGE)?,
-                thinking_dialect: dialect(&spec, &slug)?,
-                models: models(lua, &spec)?,
-                net_hosts,
-            },
+            decl,
             hooks: ProviderHooks {
                 auth: hook(&keys, HookSlot::Auth, Some(HOOK_TIMEOUT)),
                 list_models: hook(&keys, HookSlot::ListModels, Some(HOOK_TIMEOUT)),
@@ -698,78 +694,44 @@ fn must_be(key: &str, kind: &str) -> mlua::Error {
     register_error(format!("'{key}' must be a {kind}"))
 }
 
-fn field(spec: &Table, key: &str) -> LuaResult<String> {
-    optional(spec, key)?.ok_or_else(|| must_be(key, "string"))
-}
-
-fn optional(spec: &Table, key: &str) -> LuaResult<Option<String>> {
-    spec.get::<Option<String>>(key)
-        .map_err(|_| must_be(key, "string"))
-}
-
-fn optional_bool(spec: &Table, key: &str) -> LuaResult<Option<bool>> {
-    spec.get::<Option<bool>>(key)
-        .map_err(|_| must_be(key, "boolean"))
-}
-
-/// The registry holds protocols, not names, and has no parser: a codec nobody
-/// implements is caught here, where the plugin that wrote it can be named.
-fn codec(spec: &Table) -> LuaResult<Option<Protocol>> {
-    optional(spec, CODEC)?
-        .map(|name| {
-            name.parse::<Protocol>().map_err(|_| {
-                register_error(format!(
-                    "unknown codec '{name}' (expected one of openai, openai-responses, \
-                     anthropic, google)"
-                ))
-            })
-        })
-        .transpose()
-}
-
-/// Same story as [`codec`]: the dialect table lives in the registry, so a name
-/// nobody implements is caught here, where the plugin that wrote it can be
-/// named.
-fn dialect(spec: &Table, slug: &str) -> LuaResult<Option<&'static EffortDialect<'static>>> {
-    optional(spec, THINKING_DIALECT)?
-        .map(|name| plugin::thinking_dialect(slug, &name).map_err(register_error))
-        .transpose()
-}
-
-/// Model rows are static data, read here and never again, so a provider's
-/// catalogue costs nothing per request.
-fn models(lua: &Lua, spec: &Table) -> LuaResult<Vec<PluginModel>> {
-    let Some(table) = spec
-        .get::<Option<Table>>(MODELS)
-        .map_err(|_| must_be(MODELS, "list of tables"))?
-    else {
-        return Ok(Vec::new());
-    };
-    let json = lua_to_json(lua, &LuaValue::Table(table))?;
-    // An empty Lua table reads as an object, and a plugin that curates no models
-    // writes one rather than leaving the key out.
-    if json.as_object().is_some_and(serde_json::Map::is_empty) {
-        return Ok(Vec::new());
-    }
-    serde_json::from_value(json).map_err(|e| register_error(format!("invalid 'models' entry: {e}")))
-}
-
-fn hook_keys(lua: &Lua, spec: &Table) -> LuaResult<HashMap<&'static str, RegistryKey>> {
+/// Splits the spec in two: the hook functions, by the entry names
+/// [`HookSlot::spec`] lists, and the rest, which serde decodes as the
+/// declaration. So an unknown key, a codec or dialect nobody implements, or a
+/// malformed option fails here, while we can still name the plugin that wrote
+/// it.
+fn declaration(
+    lua: &Lua,
+    spec: &Table,
+) -> LuaResult<(HashMap<&'static str, RegistryKey>, ProviderDecl)> {
     let mut keys = HashMap::new();
-    for entry in HookSlot::ALL
-        .into_iter()
-        .flat_map(|slot| slot.spec().entries)
-        .map(|(_, entry)| *entry)
-    {
-        let Some(func) = spec
-            .get::<Option<Function>>(entry)
-            .map_err(|_| must_be(entry, "function"))?
+    let data = lua.create_table()?;
+    for pair in spec.pairs::<LuaValue, LuaValue>() {
+        let (key, value) = pair?;
+        let Some(entry) = key
+            .as_string()
+            .and_then(|name| hook_entry(&name.to_str().ok()?))
         else {
+            data.raw_set(key, value)?;
             continue;
+        };
+        let LuaValue::Function(func) = value else {
+            return Err(must_be(entry, "function"));
         };
         keys.insert(entry, lua.create_registry_value(func)?);
     }
-    Ok(keys)
+    let decl = lua.from_value(LuaValue::Table(data)).map_err(|e| match e {
+        mlua::Error::DeserializeError(message) => register_error(message),
+        other => register_error(other),
+    })?;
+    Ok((keys, decl))
+}
+
+fn hook_entry(name: &str) -> Option<&'static str> {
+    HookSlot::ALL
+        .into_iter()
+        .flat_map(|slot| slot.spec().entries)
+        .map(|(_, entry)| *entry)
+        .find(|entry| *entry == name)
 }
 
 /// Read the credentials this plugin stored for one of its providers.
@@ -1011,6 +973,9 @@ mod tests {
     const REGISTER_FN: &str = "register";
     const UNKNOWN_CODEC: &str = "grpc";
     const UNKNOWN_DIALECT: &str = "esperanto";
+    const STRAY_KEY: &str = "thinking_dialect";
+    const TRANSPORT_HEADER: &str = "Host";
+    const BAD_HEADER: &str = "bad header";
 
     fn keys_from(
         lua: &Lua,
@@ -1205,15 +1170,23 @@ mod tests {
         assert_eq!(error.contains(NOT_OWNED), refused, "{error}");
     }
 
+    /// Decodes `{ slug = ..., <fields> }` the way `register` does, before any
+    /// permission or registry check gets a say.
+    fn decode_spec(fields: &str) -> LuaResult<(HashMap<&'static str, RegistryKey>, ProviderDecl)> {
+        let lua = Lua::new();
+        let spec: Table = lua
+            .load(format!(r#"return {{ slug = "{SLUG_NAME}", {fields} }}"#))
+            .eval()?;
+        declaration(&lua, &spec)
+    }
+
     #[test_case("openai" ; "openai")]
     #[test_case("openai-responses" ; "openai_responses")]
     #[test_case("anthropic" ; "anthropic")]
     #[test_case("google" ; "google")]
     fn every_documented_codec_parses(name: &str) {
-        let lua = Lua::new();
-        let spec = lua.create_table().unwrap();
-        spec.set(CODEC, name).unwrap();
-        assert!(codec(&spec).unwrap().is_some(), "{name}");
+        let (_, decl) = decode_spec(&format!(r#"codec = "{name}""#)).unwrap();
+        assert!(decl.codec.is_some(), "{name}");
     }
 
     /// The registry owns the dialect names, and this doc comment is where a
@@ -1221,8 +1194,6 @@ mod tests {
     /// nobody can ask for, so the two lists are held together.
     #[test]
     fn every_dialect_name_is_documented_and_resolves() {
-        let lua = Lua::new();
-        let spec = lua.create_table().unwrap();
         let documented = DOCS
             .fns
             .iter()
@@ -1232,31 +1203,49 @@ mod tests {
 
         for name in maki_providers::dialect::NAMES {
             assert!(documented.contains(&format!("`\"{name}\"`")), "{name}");
-            spec.set(THINKING_DIALECT, *name).unwrap();
-            assert!(dialect(&spec, SLUG_NAME).unwrap().is_some(), "{name}");
+            let fields =
+                format!(r#"codec = "openai", openai = {{ thinking = {{ dialect = "{name}" }} }}"#);
+            let (_, decl) = decode_spec(&fields).unwrap();
+            assert!(
+                decl.openai.and_then(|wire| wire.thinking).is_some(),
+                "{name}"
+            );
         }
     }
 
-    /// Codec and dialect names both live in the registry, so a name nobody
-    /// implements has to be caught here, where the plugin that wrote it can be
-    /// named. The message needs both halves: which call refused, and the name
-    /// it did not know. Asserting on those rather than on the whole sentence
-    /// keeps this from breaking when the sentence is reworded.
-    #[test_case(CODEC, UNKNOWN_CODEC ; "codec")]
-    #[test_case(THINKING_DIALECT, UNKNOWN_DIALECT ; "thinking_dialect")]
-    fn an_unknown_name_is_refused_where_the_plugin_can_be_named(key: &str, name: &str) {
-        let lua = Lua::new();
-        let spec = lua.create_table().unwrap();
-        spec.set(key, name).unwrap();
+    /// The hooks travel apart from the data, so a function never reaches the
+    /// decoder and the declaration never holds one.
+    #[test]
+    fn hooks_are_taken_out_of_the_declaration() {
+        let (keys, decl) =
+            decode_spec(&format!("{BUILD_BODY} = function(body) return body end")).unwrap();
+        assert!(keys.contains_key(BUILD_BODY));
+        assert_eq!(decl.slug, SLUG_NAME);
+    }
 
-        let refusal = codec(&spec)
+    /// Everything the registry would not know what to do with is caught here,
+    /// where the plugin that wrote it can be named. The message needs both
+    /// halves: which call refused, and what it refused. Asserting on those
+    /// rather than on the whole sentence keeps this from breaking when the
+    /// sentence is reworded.
+    #[test_case(r#"codec = "grpc""#, UNKNOWN_CODEC ; "unknown_codec")]
+    #[test_case(r#"codec = "openai", openai = { thinking = { dialect = "esperanto" } }"#, UNKNOWN_DIALECT ; "unknown_dialect")]
+    #[test_case(r#"codec = "openai", thinking_dialect = "deepseek""#, STRAY_KEY ; "unknown_top_level_key")]
+    #[test_case(r#"codec = "openai", openai = { thinking = { dialect = "glm" }, thinking_dialect = "glm" }"#, STRAY_KEY ; "unknown_openai_key")]
+    #[test_case(r#"codec = "openai", openai = { headers = { Host = "evil.example" } }"#, TRANSPORT_HEADER ; "transport_header")]
+    #[test_case(r#"codec = "openai", openai = { headers = { ["bad header"] = "x" } }"#, BAD_HEADER ; "bad_header_name")]
+    #[test_case(r#"build_body = "not a function""#, BUILD_BODY ; "hook_that_is_not_a_function")]
+    fn an_invalid_declaration_is_refused_where_the_plugin_can_be_named(
+        fields: &str,
+        culprit: &str,
+    ) {
+        let error = decode_spec(fields)
             .err()
-            .or_else(|| dialect(&spec, SLUG_NAME).err())
-            .expect("an unknown name must be refused");
+            .map(|e| e.to_string())
+            .unwrap_or_default();
 
-        let error = refusal.to_string();
         assert!(error.contains(REGISTER), "{error}");
-        assert!(error.contains(name), "{error}");
+        assert!(error.contains(culprit), "{error}");
     }
 
     /// Registers `extra` on top of a minimal spec, for a registration that has

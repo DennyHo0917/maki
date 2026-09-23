@@ -60,7 +60,7 @@ maki.provider.register({
   slug = SLUG,
   codec = "openai",
   base_url = "https://api.deepseek.com",
-  thinking_dialect = "deepseek",
+  openai = { thinking = { dialect = "deepseek" } },
 
   build_body = function(body, model, opts)
     local enabled = opts.thinking ~= THINKING_OFF

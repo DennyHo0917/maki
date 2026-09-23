@@ -210,6 +210,7 @@ fn the_bundled_deepseek_plugin_pads_the_same_turns(
         name,
         script: deepseek::SUCCESS_SCRIPT,
         thinking: ThinkingConfig::Effort(deepseek::EFFORT),
+        session: None,
     };
     let tools = if with_tools {
         replay::tools()

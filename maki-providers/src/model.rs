@@ -65,8 +65,9 @@ pub struct ModelPricing {
 /// the shape a plugin may state is this one minus [`Self::provider_info`],
 /// which is a stash only the Rust provider that filled it can read back. Every
 /// optional field defaults, so an omitted one stays distinguishable from a
-/// published negative.
-#[derive(Debug, Clone, Default, Deserialize)]
+/// published negative. `Serialize` is the same shape going the other way, so a
+/// golden records every field there is rather than a hand-picked few.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct ModelInfo {
     pub id: String,
     #[serde(default)]
@@ -424,7 +425,8 @@ fn local_thinking_overlay(
 
 /// `Required` marks APIs that reject requests with thinking disabled;
 /// [`crate::RequestOptions::clamped`] raises `Off` to minimal effort for them.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum ThinkingSupport {
     No,
     Yes,

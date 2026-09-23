@@ -26,6 +26,8 @@ const OPENAI_LIMIT: &str = "maximum context length is ";
 const CONNECT_FAILED_MESSAGE: &str =
     "could not connect, check the server is running and the base URL is correct";
 const NETWORK_ERROR_MESSAGE: &str = "connection error, check your network";
+const UNREADABLE_BODY_MESSAGE: &str = "unable to read error body";
+const RETRY_AFTER_HEADER: &str = "retry-after";
 /// The request field a server names when it refuses reasoning summaries. Every
 /// Responses implementation spells the rejection with a different `code`, so
 /// the field is the only stable part of the answer.
@@ -371,26 +373,37 @@ impl AgentError {
     }
 
     pub async fn from_response(mut response: isahc::Response<isahc::AsyncBody>) -> Self {
-        let status = response.status().as_u16();
-        let retry_after = response
-            .headers()
-            .get("retry-after")
-            .and_then(|v| v.to_str().ok())
-            .and_then(parse_retry_after);
-        let message = response
+        let body = response
             .text()
             .await
-            .unwrap_or_else(|_| "unable to read error body".into());
+            .unwrap_or_else(|_| UNREADABLE_BODY_MESSAGE.into());
+        Self::from_parts(
+            response.status().as_u16(),
+            |name| response.headers().get(name).and_then(|v| v.to_str().ok()),
+            body,
+        )
+    }
+
+    /// The one classifier for a failed HTTP exchange, built from what any
+    /// client can hand over: the status, a header lookup by lowercase name,
+    /// and the body text. [`Self::from_response`] is this over isahc, and a
+    /// plugin's `maki.net` response reaches it through the same parts, so a
+    /// failure reads the same whichever side made the request.
+    pub fn from_parts<'a>(
+        status: u16,
+        header: impl Fn(&str) -> Option<&'a str>,
+        body: String,
+    ) -> Self {
         Self::Api {
             status,
-            message,
-            retry_after,
+            message: body,
+            retry_after: header(RETRY_AFTER_HEADER).and_then(parse_retry_after),
         }
     }
 
     /// How long the server asked us to wait, when it bothered to say. Always a
-    /// positive duration: only [`Self::from_response`] ever reads headers, and
-    /// an error built any other way answers `None` and the caller falls back on
+    /// positive duration: only [`Self::from_parts`] ever reads headers, and an
+    /// error built any other way answers `None` and the caller falls back on
     /// its own backoff.
     pub fn retry_after(&self) -> Option<Duration> {
         match self {
@@ -674,6 +687,25 @@ mod tests {
     #[test_case("0", None                            ; "zero")]
     fn retry_after_header_is_read_as_seconds(value: &str, expected: Option<Duration>) {
         assert_eq!(parse_retry_after(value), expected);
+    }
+
+    #[test_case(Some("7"), Some(Duration::from_secs(7)) ; "retry_after_read")]
+    #[test_case(None, None                              ; "no_retry_after")]
+    fn from_parts_reads_status_retry_after_and_body(
+        retry_after: Option<&str>,
+        expected: Option<Duration>,
+    ) {
+        const BODY: &str = r#"{"error":"slow down"}"#;
+        let error = AgentError::from_parts(
+            429,
+            |name| retry_after.filter(|_| name == RETRY_AFTER_HEADER),
+            BODY.into(),
+        );
+        assert!(matches!(
+            &error,
+            AgentError::Api { status: 429, message, .. } if message == BODY
+        ));
+        assert_eq!(error.retry_after(), expected);
     }
 
     // llama.cpp: https://github.com/ggml-org/llama.cpp/blob/master/tools/server/server-context.cpp

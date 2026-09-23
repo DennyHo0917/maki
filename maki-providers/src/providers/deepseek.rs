@@ -16,7 +16,9 @@ use crate::{AgentError, dialect};
 
 use super::Timeouts;
 use super::openai_compat::{OpenAiCompatConfig, OpenAiCompatProvider};
-use super::plugin::{self, BodyInput, Hook, ProviderDecl, ProviderHooks};
+use super::plugin::{
+    self, BodyInput, EffortField, Hook, OpenAiWire, ProviderDecl, ProviderHooks, ThinkingWire,
+};
 
 const PAD: &str = "";
 const REASONER_ID: &str = "deepseek-reasoner";
@@ -98,10 +100,15 @@ pub(crate) fn decl() -> ProviderDecl {
         base_url: Some(BASE_URL.to_owned()),
         api_key_env: None,
         system_prefix: None,
-        max_tokens_field: None,
-        include_stream_usage: None,
-        thinking_dialect: Some(&dialect::DEEPSEEK),
         models: Vec::new(),
+        openai: Some(OpenAiWire {
+            thinking: Some(ThinkingWire {
+                dialect: &dialect::DEEPSEEK,
+                field: EffortField::default(),
+                requires_support: false,
+            }),
+            ..OpenAiWire::default()
+        }),
         net_hosts: vec![NET_HOST.to_owned()],
     }
 }
@@ -404,6 +411,7 @@ data: [DONE]
         name: "success",
         script: SUCCESS_SCRIPT,
         thinking: ThinkingConfig::Effort(EFFORT),
+        session: None,
     };
     /// The mode the toggle has to spell out, since DeepSeek reasons unless it
     /// is told not to.
@@ -411,6 +419,7 @@ data: [DONE]
         name: "thinking_off",
         script: SUCCESS_SCRIPT,
         thinking: ThinkingConfig::Off,
+        session: None,
     };
     /// The quiet one: [`crate::dialect::DEEPSEEK`] declares no adaptive
     /// string, so thinking is switched on while `reasoning_effort` stays off
@@ -419,11 +428,13 @@ data: [DONE]
         name: "thinking_adaptive",
         script: SUCCESS_SCRIPT,
         thinking: ThinkingConfig::Adaptive,
+        session: None,
     };
     pub const BALANCE: Fixture = Fixture {
         name: "user_balance",
         script: &[Canned::json(200, BALANCE_BODY)],
         thinking: ThinkingConfig::Off,
+        session: None,
     };
 
     /// The padding cases, which every authoring replays against the same
@@ -434,6 +445,7 @@ data: [DONE]
             name,
             script: SUCCESS_SCRIPT,
             thinking: ThinkingConfig::Effort(EFFORT),
+            session: None,
         }
     }
 

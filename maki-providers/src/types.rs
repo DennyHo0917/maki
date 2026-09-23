@@ -592,7 +592,7 @@ fn declared_fragment(
         .map(|f| (f, false))
 }
 
-fn merge_body(body: &mut Map<String, Value>, fragment: &Map<String, Value>) {
+pub(crate) fn merge_body(body: &mut Map<String, Value>, fragment: &Map<String, Value>) {
     for (key, value) in fragment {
         match (body.get_mut(key), value.as_object()) {
             (Some(Value::Object(target)), Some(source)) => merge_body(target, source),

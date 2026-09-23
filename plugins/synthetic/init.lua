@@ -6,7 +6,9 @@ maki.provider.register({
   slug = "synthetic",
   codec = "openai",
   base_url = "https://api.synthetic.new/openai/v1",
-  max_tokens_field = "max_completion_tokens",
-  include_stream_usage = false,
-  thinking_dialect = "standard",
+  openai = {
+    max_tokens_field = "max_completion_tokens",
+    include_stream_usage = false,
+    thinking = { dialect = "standard" },
+  },
 })

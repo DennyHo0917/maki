@@ -5,7 +5,7 @@ use crate::model::ModelFamily;
 use crate::providers::aperture::DEFAULT_PATH_PREFIX;
 use crate::spec::{ApertureRoute, AuthDoc, CatalogDoc, GeneratedDocs, LoginConfig, ProviderSpec};
 
-use super::plugin::ProviderDecl;
+use super::plugin::{EffortField, OpenAiWire, ProviderDecl, ThinkingWire};
 
 const SLUG: &str = "synthetic";
 const DISPLAY_NAME: &str = "Synthetic";
@@ -69,10 +69,17 @@ pub(crate) fn decl() -> ProviderDecl {
         base_url: Some(BASE_URL.to_owned()),
         api_key_env: None,
         system_prefix: None,
-        max_tokens_field: Some(MAX_TOKENS_FIELD.to_owned()),
-        include_stream_usage: Some(false),
-        thinking_dialect: Some(&dialect::STANDARD),
         models: Vec::new(),
+        openai: Some(OpenAiWire {
+            max_tokens_field: Some(MAX_TOKENS_FIELD.to_owned()),
+            include_stream_usage: Some(false),
+            thinking: Some(ThinkingWire {
+                dialect: &dialect::STANDARD,
+                field: EffortField::default(),
+                requires_support: false,
+            }),
+            ..OpenAiWire::default()
+        }),
         net_hosts: vec![NET_HOST.to_owned()],
     }
 }
@@ -94,7 +101,7 @@ pub mod fixtures {
 
     pub const MODEL_SPEC: &str = "synthetic/hf:moonshotai/Kimi-K2.5";
     /// Reaches the wire as `reasoning_effort`, which is the one thing
-    /// [`super::decl`]'s `thinking_dialect` is there to do.
+    /// [`super::decl`]'s `thinking` dialect is there to do.
     const EFFORT: Effort = Effort::High;
     const UNKNOWN_MODEL: &str = "the curated table has no such model";
 
@@ -120,6 +127,7 @@ data: [DONE]
         name: "success",
         script: &[Canned::sse(SUCCESS_TRANSCRIPT)],
         thinking: ThinkingConfig::Effort(EFFORT),
+        session: None,
     };
 }
 

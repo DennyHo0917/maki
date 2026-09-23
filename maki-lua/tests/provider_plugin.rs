@@ -141,6 +141,7 @@ const REFRESH_SCRIPT: &[Canned] = &[
         status: 401,
         headers: JSON_HEADERS,
         body: EXPIRED_TOKEN_BODY,
+        path: None,
     },
     Canned::sse(CHAT_TRANSCRIPT),
     Canned::sse(CHAT_TRANSCRIPT),
@@ -149,11 +150,13 @@ const ALLOWANCE_SCRIPT: &[Canned] = &[Canned {
     status: 429,
     headers: SLOW_DOWN_HEADERS,
     body: ALLOWANCE_BODY,
+    path: None,
 }];
 const OVERLOADED_SCRIPT: &[Canned] = &[Canned {
     status: 503,
     headers: SLOW_DOWN_HEADERS,
     body: OVERLOADED_BODY,
+    path: None,
 }];
 
 /// Points every base directory at a throwaway tree, so the credentials the

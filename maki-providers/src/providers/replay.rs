@@ -14,9 +14,9 @@
 //! boots the plugin host and registers the bundled decl over the top, both
 //! against these same files.
 //!
-//! A provider still on its bespoke impl records its goldens through
-//! [`bespoke`], which builds it in the same isolated world and writes the same
-//! files, so what it records is what the declaration replays once ported.
+//! Every golden was recorded once, against the bespoke impl the declaration
+//! replaced, and is never regenerated after that impl is gone: the files are
+//! the spec both authorings answer to.
 //!
 //! Regenerate with `UPDATE_GOLDENS=1 cargo nextest run -p maki-providers`.
 //! A *missing* golden always fails, because a suite that records whatever it
@@ -87,7 +87,6 @@ const NOT_AN_OBJECT: &str = "an observation is always a json object";
 const NO_REQUESTS: &str = "every observation records the requests it sent";
 const TEMPDIR_FAILED: &str = "no temporary state directory";
 const NOT_A_BUILTIN: &str = "a replayed slug is a builtin";
-const NOT_BESPOKE: &str = "a bespoke replay needs a slug with a native impl";
 const CREATE_FAILED: &str = "the provider could not be built";
 const BAD_SESSION: &str = "a fixture's session is a stored session id";
 const NO_MIDNIGHT: &str = "the day after a sampled one is representable";
@@ -270,44 +269,6 @@ pub fn declared_discovered<T>(
     Replay::declared(stage, slug, fixture).discovered(model);
 }
 
-/// Records a provider that still runs its bespoke impl, built through
-/// `spec.native.new` in the same isolated world the declared path uses and
-/// asserted against the same file. What it records under `UPDATE_GOLDENS=1`
-/// is what the declaration replays once it replaces the impl.
-///
-/// Transient: it only exists while ports are recorded, and it goes with the
-/// last bespoke impl.
-pub fn bespoke(slug: &str) -> Bespoke<'_> {
-    Bespoke { slug }
-}
-
-/// The declared entry points, one for one, against a bespoke impl.
-pub struct Bespoke<'a> {
-    slug: &'a str,
-}
-
-impl Bespoke<'_> {
-    pub fn stream(&self, fixture: &Fixture, model: &Model) {
-        self.with(fixture, model, &turn(), &tools());
-    }
-
-    pub fn with(&self, fixture: &Fixture, model: &Model, messages: &[Message], tools: &Value) {
-        Replay::bespoke(self.slug, fixture).stream(model, messages, tools);
-    }
-
-    pub fn usage(&self, fixture: &Fixture) {
-        Replay::bespoke(self.slug, fixture).usage();
-    }
-
-    pub fn models(&self, fixture: &Fixture) {
-        Replay::bespoke(self.slug, fixture).models();
-    }
-
-    pub fn discovered(&self, fixture: &Fixture, model: &Model) {
-        Replay::bespoke(self.slug, fixture).discovered(model);
-    }
-}
-
 /// One exchange ready to run: the provider under test, what the recorded
 /// server has seen, and the world both of them live in.
 ///
@@ -321,17 +282,6 @@ struct Replay<'a, G> {
     slug: &'a str,
     fixture: &'a Fixture,
     _world: (G, TempDir),
-}
-
-impl<'a> Replay<'a, ()> {
-    fn bespoke(slug: &'a str, fixture: &'a Fixture) -> Self {
-        Self::open(slug, fixture, || {
-            let native = ProviderRegistry::get(slug)
-                .and_then(|spec| spec.native)
-                .expect(NOT_BESPOKE);
-            ((native.new)(Timeouts::default()).expect(CREATE_FAILED), ())
-        })
-    }
 }
 
 impl<'a, G> Replay<'a, G> {

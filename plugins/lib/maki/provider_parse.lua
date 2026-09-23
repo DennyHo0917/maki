@@ -12,6 +12,15 @@
 -- nil. Tables that did not come from `M.decode` carry no float marks, so there
 -- a whole-valued float passes as an integer.
 --
+-- A JSON null decodes to nil, which looks like a missing key and leaves a hole
+-- that stops `#` and `ipairs` early. `M.decode` also remembers where the nulls
+-- were: `M.is_null` tells them from missing keys, and `M.items` walks an array
+-- the way Rust's `as_array().iter()` does, nulls included.
+--
+-- `M.get_json` and `M.models` are the two halves of the Rust side's
+-- `fetch_and_parse_models`, for a hook that fetches off the codec's request
+-- path.
+--
 -- Luau numbers are doubles: a u64 above 2^53 comes back rounded, and
 -- u64::MAX reads as 2^64.
 local M = {}
@@ -23,10 +32,23 @@ local QUOTE = string.byte('"')
 local BACKSLASH = string.byte("\\")
 local FLOAT_TAG = "\0f64:"
 local FLOAT_TAG_JSON = '"\\u0000f64:'
-local RESERVED_STRING = "string starts with the reserved float tag"
+local NULL_TAG = "\0null"
+local NULL_TAG_JSON = '"\\u0000null"'
+local NULL_LITERAL = "null"
+local RESERVED_STRING = "string holds a reserved decode tag"
 local NAN = 0 / 0
+local HTTP_OK = 200
+-- The Rust side never retries these calls, so a retried 5xx would show up as
+-- extra requests in a golden.
+local NO_RETRY = 0
 
 local float_keys = setmetatable({}, { __mode = "k" })
+local null_keys = setmetatable({}, { __mode = "k" })
+local array_lens = setmetatable({}, { __mode = "k" })
+
+local function starts_with_at(text, start, prefix)
+  return string.sub(text, start, start + #prefix - 1) == prefix
+end
 
 local function string_end(text, start)
   local pos = start + 1
@@ -48,23 +70,28 @@ local function overflows_u64(lexeme)
 end
 
 -- Every number serde_json parses as a float becomes a tagged string holding
--- its index in the returned lexeme list.
-local function tag_floats(text)
+-- its index in the returned lexeme list, and every null a tagged string.
+local function tag_values(text)
   local pieces, lexemes = {}, {}
   local pos, copied = 1, 1
   while true do
-    local start = string.find(text, '[%-%d"]', pos)
+    local start = string.find(text, '[%-%dn"]', pos)
     if not start then
       break
     end
     if string.byte(text, start) == QUOTE then
       if
         string.byte(text, start + 1) == BACKSLASH
-        and string.sub(text, start, start + #FLOAT_TAG_JSON - 1) == FLOAT_TAG_JSON
+        and (starts_with_at(text, start, FLOAT_TAG_JSON) or starts_with_at(text, start, NULL_TAG_JSON))
       then
         return nil, nil, RESERVED_STRING
       end
       pos = string_end(text, start) + 1
+    elseif starts_with_at(text, start, NULL_LITERAL) then
+      table.insert(pieces, string.sub(text, copied, start - 1))
+      table.insert(pieces, NULL_TAG_JSON)
+      copied = start + #NULL_LITERAL
+      pos = copied
     else
       local _, int_end = string.find(text, "^%-?%d+", start)
       local stop = int_end or start
@@ -88,26 +115,39 @@ local function tag_floats(text)
   return table.concat(pieces), lexemes
 end
 
-local function restore_floats(node, values)
+local function mark(marks, node, key)
+  marks[node] = marks[node] or {}
+  marks[node][key] = true
+end
+
+-- Arrays come back without holes while every null is still a tag, so the
+-- length is taken before any tag is cleared.
+local function restore(node, values)
+  local count = #node
   for key, value in pairs(node) do
     if type(value) == "table" then
-      restore_floats(value, values)
+      restore(value, values)
+    elseif value == NULL_TAG then
+      node[key] = nil
+      mark(null_keys, node, key)
+      if type(key) == "number" then
+        array_lens[node] = count
+      end
     elseif type(value) == "string" and string.sub(value, 1, #FLOAT_TAG) == FLOAT_TAG then
       node[key] = values[tonumber(string.sub(value, #FLOAT_TAG + 1))]
-      float_keys[node] = float_keys[node] or {}
-      float_keys[node][key] = true
+      mark(float_keys, node, key)
     end
   end
 end
 
 --- `maki.json.decode`, plus a record of which numbers serde_json would read
---- as floats. Returns the value, or nil and an error.
+--- as floats and where the nulls were. Returns the value, or nil and an error.
 function M.decode(text)
-  local tagged, lexemes, err = tag_floats(text)
+  local tagged, lexemes, err = tag_values(text)
   if err then
     return nil, err
   end
-  if #lexemes == 0 then
+  if tagged == text then
     return maki.json.decode(text)
   end
   local wrapper = maki.json.decode("[" .. tagged .. "]")
@@ -116,8 +156,67 @@ function M.decode(text)
   end
   -- serde_json parses each float, so the value matches Rust's to the bit.
   local values = maki.json.decode("[" .. table.concat(lexemes, ",") .. "]")
-  restore_floats(wrapper, values)
+  restore(wrapper, values)
   return wrapper[1]
+end
+
+--- serde_json `tbl.get(key).is_some_and(Value::is_null)`: true only where the
+--- decoded JSON held a null, never for a missing key or a table that did not
+--- come from `M.decode`.
+function M.is_null(tbl, key)
+  if type(tbl) ~= "table" then
+    return false
+  end
+  local nulls = null_keys[tbl]
+  return nulls ~= nil and nulls[key] == true
+end
+
+--- The JSON array's length, nulls included. `#arr` for a table that did not
+--- come from `M.decode`, 0 for a non-table.
+function M.len(arr)
+  if type(arr) ~= "table" then
+    return 0
+  end
+  return array_lens[arr] or #arr
+end
+
+--- Rust `as_array().iter().enumerate()`, 1-based: `for i, v in M.items(arr)`
+--- visits every index up to `M.len(arr)`, with v nil for a null element.
+function M.items(arr)
+  local count = M.len(arr)
+  return function(tbl, index)
+    index = index + 1
+    if index <= count then
+      return index, tbl[index]
+    end
+    return nil
+  end,
+    arr,
+    0
+end
+
+--- Rust `get_text` then `serde_json::from_str`: a GET with the provider's
+--- resolved `auth`, never retried. Returns the decoded body, nil for a JSON
+--- null. On failure returns nil and an error for `M.fail`.
+function M.get_json(auth, url)
+  local res, err = maki.net.request(url, { headers = auth.headers, retry = NO_RETRY })
+  if not res then
+    return nil, err
+  end
+  if res.status ~= HTTP_OK then
+    return nil, maki.provider.http_error(res)
+  end
+  return M.decode(res.body)
+end
+
+--- Hands a `M.get_json` error back from a hook. A refused request is returned,
+--- so it fails the way the native provider does. Anything else never got an
+--- HTTP status and is raised.
+function M.fail(err)
+  if type(err) == "string" then
+    error(err, 0)
+  end
+  return nil, err
 end
 
 local function whole_at(tbl, key, max)
@@ -149,6 +248,14 @@ end
 --- serde_json `Value::as_f64` on `tbl[key]`: any number, integer or float.
 function M.as_f64(tbl, key)
   if type(tbl) ~= "table" or type(tbl[key]) ~= "number" then
+    return nil
+  end
+  return tbl[key]
+end
+
+--- serde_json `Value::as_bool` on `tbl[key]`.
+function M.as_bool(tbl, key)
+  if type(tbl) ~= "table" or type(tbl[key]) ~= "boolean" then
     return nil
   end
   return tbl[key]
@@ -236,6 +343,23 @@ function M.stable_sort_by(list, less)
   if src ~= list then
     table.move(src, 1, len, 1, list)
   end
+end
+
+--- The rest of Rust `fetch_and_parse_models`: each `body.data` element through
+--- `parse_row`, nils dropped, sorted by `id`. A body without a `data` array
+--- lists nothing.
+function M.models(body, parse_row)
+  local rows = {}
+  for _, raw in M.items(type(body) == "table" and body.data) do
+    local row = parse_row(raw)
+    if row then
+      table.insert(rows, row)
+    end
+  end
+  M.stable_sort_by(rows, function(a, b)
+    return a.id < b.id
+  end)
+  return rows
 end
 
 return M

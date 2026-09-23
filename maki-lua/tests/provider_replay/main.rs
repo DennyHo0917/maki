@@ -33,11 +33,26 @@ use serde_json::Value;
 use tempfile::TempDir;
 use test_case::test_case;
 
+mod mistral;
+mod openrouter;
+mod regolo;
+mod requesty;
+mod tensorx;
+
 const SYNTHETIC: &str = "synthetic";
 const SYNTHETIC_HOST: &str = "api.synthetic.new";
 const DEEPSEEK: &str = "deepseek";
 const DEEPSEEK_HOST: &str = "api.deepseek.com";
-const LOOPBACK_HOST: &str = "127.0.0.1";
+const MISTRAL: &str = "mistral";
+const MISTRAL_HOST: &str = "api.mistral.ai";
+const TENSORX: &str = "tensorx";
+const TENSORX_HOST: &str = "api.tensorx.ai";
+const REGOLO: &str = "regolo";
+const REGOLO_HOST: &str = "api.regolo.ai";
+const REQUESTY: &str = "requesty";
+const REQUESTY_HOST: &str = "router.requesty.ai";
+const OPENROUTER: &str = "openrouter";
+const OPENROUTER_HOST: &str = "openrouter.ai";
 
 const PROVIDERS_FILE: &str = "providers.toml";
 /// The whole of the escape hatch: it picks the author and defines nothing.
@@ -80,11 +95,11 @@ fn plugin_host() -> PluginHost {
 /// ambiguous, loaded with the permissions its own `plugin.toml` declares, so
 /// what is under test is the plugin exactly as it ships.
 ///
-/// Loopback is waved past the SSRF guard because that is where the recorded
-/// server listens. The host comes back instead of being dropped, since a hook
+/// Nothing waves loopback past the SSRF guard: the recorded server listens on
+/// the origin `<SLUG>_BASE_URL` names, which is the one a user points at a
+/// local gateway. The host comes back instead of being dropped, since a hook
 /// whose host has died answers nothing.
 fn load_bundled(slug: &str) -> PluginHost {
-    maki_lua::set_allowed_private_hosts(&[LOOPBACK_HOST.to_owned()]);
     let mut host = plugin_host();
     host.load_builtins(&PluginsConfig {
         enabled: true,
@@ -122,6 +137,11 @@ fn assert_same_decl(left: &ProviderDecl, right: &ProviderDecl) {
 /// comparison cannot pass by finding maki's own on both sides.
 #[test_case(SYNTHETIC ; "synthetic")]
 #[test_case(DEEPSEEK ; "deepseek")]
+#[test_case(MISTRAL ; "mistral")]
+#[test_case(TENSORX ; "tensorx")]
+#[test_case(REGOLO ; "regolo")]
+#[test_case(REQUESTY ; "requesty")]
+#[test_case(OPENROUTER ; "openrouter")]
 fn the_bundled_lua_decl_is_the_declaration_maki_authors(slug: &str) {
     let _state = isolated_state();
     let _host = load_bundled(slug);
@@ -137,6 +157,11 @@ fn the_bundled_lua_decl_is_the_declaration_maki_authors(slug: &str) {
 /// to declare is what tells the two apart.
 #[test_case(SYNTHETIC, SYNTHETIC_HOST ; "synthetic")]
 #[test_case(DEEPSEEK, DEEPSEEK_HOST ; "deepseek")]
+#[test_case(MISTRAL, MISTRAL_HOST ; "mistral")]
+#[test_case(TENSORX, TENSORX_HOST ; "tensorx")]
+#[test_case(REGOLO, REGOLO_HOST ; "regolo")]
+#[test_case(REQUESTY, REQUESTY_HOST ; "requesty")]
+#[test_case(OPENROUTER, OPENROUTER_HOST ; "openrouter")]
 fn the_configured_impl_keeps_the_declaration_maki_ships(slug: &str, net_host: &str) {
     let _state = isolated_state();
     let config_dir = maki_storage::paths::config_dir().expect(CONFIG_DIR_FAILED);

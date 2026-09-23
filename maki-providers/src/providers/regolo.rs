@@ -1,26 +1,29 @@
 use std::borrow::Cow;
 use std::cmp::Reverse;
 use std::collections::BTreeMap;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
-use flume::Sender;
-use maki_storage::id::SessionRef;
+use futures_lite::future::zip;
+use jiff::Timestamp;
+use jiff::civil::Date;
+use jiff::tz::TimeZone;
 use serde::Deserialize;
-use serde_json::Value;
+use serde::de::DeserializeOwned;
 
 use maki_config::providers::Protocol;
 
-use crate::model::{Model, ModelFamily, ModelPricing};
-use crate::provider::{BoxFuture, Provider};
+use crate::model::{ModelFamily, ModelInfo, ModelPricing};
+use crate::provider::BoxFuture;
 use crate::providers::aperture::DEFAULT_PATH_PREFIX;
-use crate::spec::{
-    ApertureRoute, AuthDoc, CatalogDoc, GeneratedDocs, LoginConfig, Native, ProviderSpec,
-};
-use crate::types::{ModelUsageRow, ProviderUsage, UsageLimit};
-use crate::{AgentError, Message, ProviderEvent, RequestOptions, StreamResponse, dialect};
+use crate::spec::{ApertureRoute, AuthDoc, CatalogDoc, GeneratedDocs, LoginConfig, ProviderSpec};
+use crate::types::{ModelUsageRow, ProviderUsage, UsageLimit, rfc3339_millis};
+use crate::{AgentError, dialect};
 
 use super::openai_compat::{OpenAiCompatConfig, OpenAiCompatProvider};
-use super::{KeyHeader, KeyPool, KeyRotation, ResolvedAuth, Timeouts};
+use super::plugin::{
+    self, EffortField, Hook, OpenAiWire, ProviderDecl, ProviderHooks, ThinkingWire,
+};
+use super::{ResolvedAuth, Timeouts};
 
 const SLUG: &str = "regolo";
 const DISPLAY_NAME: &str = "Regolo";
@@ -30,6 +33,16 @@ const DEFAULT_MODEL: &str = "regolo/qwen3-coder-next";
 const LOGIN_URL: &str = "https://dashboard.regolo.ai";
 const MAX_TOKENS_FIELD: &str = "max_completion_tokens";
 const FEATURES: &str = "EU-hosted open-weight models with tool calling. The catalogue and prices are listed live from the API";
+const NET_HOST: &str = "api.regolo.ai";
+
+const KEY_INFO_PATH: &str = "/key/info";
+const ACTIVITY_PATH: &str = "/global/activity";
+const SPEND_LOGS_PATH: &str = "/spend/logs/v2";
+const MODEL_GROUP_INFO_PATH: &str = "/model_group/info";
+const VERSION_SEGMENT: &str = "/v1";
+const CHAT_MODE: &str = "chat";
+const PER_MILLION: f64 = 1_000_000.0;
+const SECONDS_PER_DAY: i64 = 86_400;
 
 static CONFIG: OpenAiCompatConfig = OpenAiCompatConfig {
     slug: Cow::Borrowed(SLUG),
@@ -51,10 +64,7 @@ pub(crate) const SPEC: ProviderSpec = ProviderSpec {
     fallback_context_window: 120_000,
     models_toml: include_str!("../../models/regolo.toml"),
     pricing_schedule: None,
-    native: Some(Native {
-        new: create,
-        with_auth: create_with_auth,
-    }),
+    native: None,
     aperture: Some(ApertureRoute {
         path_prefix: DEFAULT_PATH_PREFIX,
     }),
@@ -75,19 +85,151 @@ pub(crate) const SPEC: ProviderSpec = ProviderSpec {
     },
 };
 
-fn create(timeouts: Timeouts) -> Result<Box<dyn Provider>, AgentError> {
-    Ok(Box::new(Regolo::new(timeouts)?))
-}
-
-fn create_with_auth(
-    auth: Arc<Mutex<ResolvedAuth>>,
-    timeouts: Timeouts,
-    system_prefix: Option<String>,
-) -> Box<dyn Provider> {
-    Box::new(Regolo::with_auth(auth, timeouts).with_system_prefix(system_prefix))
-}
-
 inventory::submit!(SPEC.config_row());
+
+/// Regolo as a declaration, plus the catalogue and the usage report the openai
+/// codec cannot fetch, see [`hooks`].
+///
+/// Only what the codec cannot guess is stated here: Regolo takes
+/// `max_completion_tokens` and the `standard` effort ladder. Claiming a
+/// built-in slug inherits the rest of [`SPEC`], and streamed usage is already
+/// the codec's default.
+///
+/// The bundled `regolo` Lua plugin says all of this again on the surface a
+/// third-party plugin uses, and outranks this at every real startup.
+pub(crate) fn decl() -> ProviderDecl {
+    ProviderDecl {
+        slug: SLUG.to_owned(),
+        display_name: None,
+        codec: Some(Protocol::Openai),
+        base: None,
+        base_url: Some(BASE_URL.to_owned()),
+        api_key_env: None,
+        system_prefix: None,
+        models: Vec::new(),
+        openai: Some(OpenAiWire {
+            max_tokens_field: Some(MAX_TOKENS_FIELD.to_owned()),
+            thinking: Some(ThinkingWire {
+                dialect: &dialect::STANDARD,
+                field: EffortField::default(),
+                requires_support: false,
+            }),
+            ..OpenAiWire::default()
+        }),
+        net_hosts: vec![NET_HOST.to_owned()],
+    }
+}
+
+/// The two callbacks [`decl`] cannot spell, registered alongside it.
+pub(crate) fn hooks() -> ProviderHooks {
+    ProviderHooks {
+        list_models: Some(Arc::new(Catalogue)),
+        fetch_usage: Some(Arc::new(Spend)),
+        ..ProviderHooks::default()
+    }
+}
+
+fn registered() -> Result<(ResolvedAuth, OpenAiCompatProvider), AgentError> {
+    let auth = plugin::registered_auth(SLUG)?;
+    let compat = OpenAiCompatProvider::new(&CONFIG, Timeouts::default());
+    Ok((auth, compat))
+}
+
+/// Regolo's management endpoints live at the host root, outside `/v1`, so
+/// they must not be absolute urls: a custom base url or a gateway (Aperture)
+/// keeps serving them, an absolute one would bypass it and 401 on its key.
+fn root_url(base: &str) -> String {
+    let trimmed = base.trim_end_matches('/');
+    trimmed
+        .strip_suffix(VERSION_SEGMENT)
+        .unwrap_or(trimmed)
+        .to_string()
+}
+
+/// The callable ids from `/v1/models`, joined with `/model_group/info`.
+struct Catalogue;
+
+impl Hook<(), Vec<ModelInfo>> for Catalogue {
+    fn call(&self, (): ()) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
+        Box::pin(async move {
+            let (auth, compat) = registered()?;
+            let ids: Vec<String> = compat
+                .do_list_models(&auth)
+                .await?
+                .into_iter()
+                .map(|info| info.id)
+                .collect();
+            let root = root_url(&compat.base_url(&auth));
+            let url = format!("{root}{MODEL_GROUP_INFO_PATH}");
+            let groups = fetch_optional::<ModelGroupInfoResponse>(&compat, &auth, &url).await;
+            Ok(match groups {
+                Some(groups) => join_model_info(ids, groups.data),
+                // The endpoint hiccups (it has 500ed): keep the live ids
+                // without metadata instead of dropping to the static few.
+                None => ids.into_iter().map(ModelInfo::id_only).collect(),
+            })
+        })
+    }
+}
+
+/// The key's spend against its budget, which the report cannot do without,
+/// then today's activity and per-model spend, fetched together and each
+/// dropped on its own when it fails.
+struct Spend;
+
+impl Hook<(), Option<ProviderUsage>> for Spend {
+    fn call(&self, (): ()) -> BoxFuture<'_, Result<Option<ProviderUsage>, AgentError>> {
+        Box::pin(async move {
+            let (auth, compat) = registered()?;
+            let root = root_url(&compat.base_url(&auth));
+            let key_body = compat
+                .get_text(&auth, &format!("{root}{KEY_INFO_PATH}"))
+                .await?;
+            let key_info: KeyInfoResponse = serde_json::from_str(&key_body)?;
+            let today = Timestamp::now().to_zoned(TimeZone::UTC).date();
+            let (activity, spend_logs) = zip(
+                fetch_optional::<ActivityResponse>(
+                    &compat,
+                    &auth,
+                    &day_url(&root, ACTIVITY_PATH, today),
+                ),
+                fetch_optional::<SpendLogsResponse>(
+                    &compat,
+                    &auth,
+                    &day_url(&root, SPEND_LOGS_PATH, today),
+                ),
+            )
+            .await;
+            let mut limits = vec![UsageLimit::from(key_info.info)];
+            limits.extend(activity.map(UsageLimit::from));
+            Ok(Some(ProviderUsage {
+                plan: None,
+                limits,
+                by_model_today: spend_logs
+                    .map(SpendLogsResponse::into_rows)
+                    .unwrap_or_default(),
+            }))
+        })
+    }
+}
+
+/// A side answer the caller can do without: any failure, the status or the
+/// shape, reads as no answer.
+async fn fetch_optional<T: DeserializeOwned>(
+    compat: &OpenAiCompatProvider,
+    auth: &ResolvedAuth,
+    url: &str,
+) -> Option<T> {
+    let body = compat.get_text(auth, url).await.ok()?;
+    serde_json::from_str(&body).ok()
+}
+
+/// `/global/activity` is key-scoped despite its name and answers per UTC day.
+/// `/spend/logs/v2` takes the same end-inclusive YYYY-MM-DD range and answers
+/// one row per model per hour, so its rows are summed per model.
+fn day_url(root: &str, path: &str, day: Date) -> String {
+    format!("{root}{path}?start_date={day}&end_date={day}")
+}
 
 #[derive(Deserialize)]
 struct SpendLogsResponse {
@@ -156,15 +298,10 @@ impl From<KeyInfo> for UsageLimit {
             .max_budget
             .filter(|budget| *budget > 0.0)
             .map(|budget| ((info.spend / budget * 100.0) as u32).min(100));
-        let reset_at = info
-            .budget_reset_at
-            .as_deref()
-            .and_then(|at| at.parse::<jiff::Timestamp>().ok())
-            .map(|at| at.as_millisecond().max(0) as u64);
         Self {
             label: "Spend".into(),
             percentage,
-            reset_at,
+            reset_at: info.budget_reset_at.as_deref().and_then(rfc3339_millis),
             detail: Some(detail),
         }
     }
@@ -176,20 +313,9 @@ struct ActivityResponse {
     sum_total_tokens: u64,
 }
 
-/// `/global/activity` is key-scoped despite its name and answers per UTC day.
-fn activity_url(root: &str, day: jiff::civil::Date) -> String {
-    format!("{root}{ACTIVITY_PATH}?start_date={day}&end_date={day}")
-}
-
-/// `/spend/logs/v2` accepts YYYY-MM-DD, end-inclusive. One hour = one row per
-/// model, so callers must sum across rows to get per-model daily totals.
-fn spend_logs_url(root: &str, day: jiff::civil::Date) -> String {
-    format!("{root}{SPEND_LOGS_PATH}?start_date={day}&end_date={day}")
-}
-
-fn next_utc_midnight(now: jiff::Timestamp) -> Option<u64> {
+fn next_utc_midnight(now: Timestamp) -> Option<u64> {
     let day = now.as_second().div_euclid(SECONDS_PER_DAY) + 1;
-    jiff::Timestamp::from_second(day * SECONDS_PER_DAY)
+    Timestamp::from_second(day * SECONDS_PER_DAY)
         .ok()
         .map(|at| at.as_millisecond() as u64)
 }
@@ -201,7 +327,7 @@ impl From<ActivityResponse> for UsageLimit {
             // Regolo tracks a per-account daily token cap (free trial: 1M) but
             // no endpoint reports it, so there is no honest percentage to show.
             percentage: None,
-            reset_at: next_utc_midnight(jiff::Timestamp::now()),
+            reset_at: next_utc_midnight(Timestamp::now()),
             detail: Some(format!(
                 "{} requests · {} tokens",
                 activity.sum_api_requests, activity.sum_total_tokens
@@ -232,7 +358,7 @@ struct ModelGroup {
 /// `/model_group/info`. Groups in a non-chat `mode` (embedding, rerank, ocr,
 /// image, audio) and IDs without a chat group are not agent models. Order
 /// follows `ids`, which the compat lister already sorts.
-fn join_model_info(ids: Vec<String>, groups: Vec<ModelGroup>) -> Vec<crate::model::ModelInfo> {
+fn join_model_info(ids: Vec<String>, groups: Vec<ModelGroup>) -> Vec<ModelInfo> {
     let by_group: BTreeMap<&str, &ModelGroup> = groups
         .iter()
         .filter(|group| group.mode == CHAT_MODE)
@@ -250,7 +376,7 @@ fn join_model_info(ids: Vec<String>, groups: Vec<ModelGroup>) -> Vec<crate::mode
                 )),
                 _ => None,
             };
-            Some(crate::model::ModelInfo {
+            Some(ModelInfo {
                 context_window: group
                     .max_input_tokens
                     .or(group.max_tokens)
@@ -261,170 +387,14 @@ fn join_model_info(ids: Vec<String>, groups: Vec<ModelGroup>) -> Vec<crate::mode
                 pricing,
                 supports_thinking: Some(group.supports_reasoning),
                 supports_vision: Some(group.supports_vision),
-                id,
-                tier: None,
-                provider_info: None,
+                ..ModelInfo::id_only(id)
             })
         })
         .collect()
 }
 
-pub struct Regolo {
-    compat: OpenAiCompatProvider,
-    auth: Arc<Mutex<ResolvedAuth>>,
-    key_pool: Option<KeyPool>,
-    system_prefix: Option<String>,
-}
-
-const KEY_INFO_PATH: &str = "/key/info";
-const ACTIVITY_PATH: &str = "/global/activity";
-const SPEND_LOGS_PATH: &str = "/spend/logs/v2";
-const MODEL_GROUP_INFO_PATH: &str = "/model_group/info";
-
-/// Regolo's management endpoints live at the host root, outside `/v1`, so
-/// they must not be absolute urls: a custom base url or a gateway (Aperture)
-/// keeps serving them, an absolute one would bypass it and 401 on its key.
-fn root_url(base: &str) -> String {
-    let trimmed = base.trim_end_matches('/');
-    trimmed.strip_suffix("/v1").unwrap_or(trimmed).to_string()
-}
-const CHAT_MODE: &str = "chat";
-const PER_MILLION: f64 = 1_000_000.0;
-const SECONDS_PER_DAY: i64 = 86_400;
-
-impl Regolo {
-    pub fn new(timeouts: super::Timeouts) -> Result<Self, AgentError> {
-        let pool = KeyPool::resolve(&CONFIG.slug, &CONFIG.api_key_env)?;
-        Ok(Self {
-            compat: OpenAiCompatProvider::new(&CONFIG, timeouts),
-            auth: Arc::new(Mutex::new(ResolvedAuth::bearer(
-                &CONFIG.slug,
-                pool.current(),
-            )?)),
-            key_pool: Some(pool),
-            system_prefix: None,
-        })
-    }
-
-    pub(crate) fn with_auth(auth: Arc<Mutex<ResolvedAuth>>, timeouts: super::Timeouts) -> Self {
-        Self {
-            compat: OpenAiCompatProvider::new(&CONFIG, timeouts),
-            auth,
-            key_pool: None,
-            system_prefix: None,
-        }
-    }
-
-    pub(crate) fn with_system_prefix(mut self, prefix: Option<String>) -> Self {
-        self.system_prefix = prefix;
-        self
-    }
-}
-
-impl Provider for Regolo {
-    fn stream_message<'a>(
-        &'a self,
-        model: &'a Model,
-        messages: &'a [Message],
-        system: &'a str,
-        tools: &'a Value,
-        event_tx: &'a Sender<ProviderEvent>,
-        opts: RequestOptions,
-        _session_id: Option<&'a SessionRef>,
-    ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
-        Box::pin(async move {
-            let auth = self.auth.lock().unwrap().clone();
-            let mut buf = String::new();
-            let system = super::with_prefix(&self.system_prefix, system, &mut buf);
-            let mut body = self.compat.build_body(model, messages, system, tools);
-            opts.thinking
-                .apply_reasoning_effort(&mut body, &dialect::STANDARD, model);
-            self.compat
-                .do_stream(model, &[], &body, event_tx, &auth)
-                .await
-        })
-    }
-
-    fn list_models(&self) -> BoxFuture<'_, Result<Vec<crate::model::ModelInfo>, AgentError>> {
-        Box::pin(async move {
-            let auth = self.auth.lock().unwrap().clone();
-            let ids = self
-                .compat
-                .do_list_models(&auth)
-                .await?
-                .into_iter()
-                .map(|info| info.id)
-                .collect::<Vec<_>>();
-            let root = root_url(&self.compat.base_url(&auth));
-            let groups = self
-                .compat
-                .get_text(&auth, &format!("{root}{MODEL_GROUP_INFO_PATH}"))
-                .await
-                .ok()
-                .and_then(|body| serde_json::from_str::<ModelGroupInfoResponse>(&body).ok());
-            match groups {
-                Some(groups) => Ok(join_model_info(ids, groups.data)),
-                // The endpoint hiccups (it has 500ed): keep the live ids
-                // without metadata instead of dropping to the static few.
-                None => Ok(ids
-                    .into_iter()
-                    .map(|id| crate::model::ModelInfo {
-                        id,
-                        ..Default::default()
-                    })
-                    .collect()),
-            }
-        })
-    }
-
-    fn fetch_usage(&self) -> BoxFuture<'_, Result<Option<ProviderUsage>, AgentError>> {
-        Box::pin(async move {
-            let auth = self.auth.lock().unwrap().clone();
-            let root = root_url(&self.compat.base_url(&auth));
-            let key_body = self
-                .compat
-                .get_text(&auth, &format!("{root}{KEY_INFO_PATH}"))
-                .await?;
-            let key_info: KeyInfoResponse = serde_json::from_str(&key_body)?;
-            let mut limits = vec![UsageLimit::from(key_info.info)];
-            let today = jiff::Timestamp::now()
-                .to_zoned(jiff::tz::TimeZone::UTC)
-                .date();
-            if let Ok(body) = self
-                .compat
-                .get_text(&auth, &activity_url(&root, today))
-                .await
-                && let Ok(activity) = serde_json::from_str::<ActivityResponse>(&body)
-            {
-                limits.push(activity.into());
-            }
-            let by_model_today = self
-                .compat
-                .get_text(&auth, &spend_logs_url(&root, today))
-                .await
-                .ok()
-                .and_then(|body| serde_json::from_str::<SpendLogsResponse>(&body).ok())
-                .map(SpendLogsResponse::into_rows)
-                .unwrap_or_default();
-            Ok(Some(ProviderUsage {
-                plan: None,
-                limits,
-                by_model_today,
-            }))
-        })
-    }
-
-    fn keys(&self) -> Option<KeyRotation<'_>> {
-        Some(KeyRotation::new(
-            self.key_pool.as_ref()?,
-            &self.auth,
-            KeyHeader::Bearer,
-        ))
-    }
-}
-
-/// The recorded cases, kept out of the test modules so every authoring replays
-/// the same list. Recorded against the bespoke `Regolo` impl.
+/// The recorded cases, kept out of the test modules so both authorings replay
+/// the same list: [`decl`] plus [`hooks`], and the bundled `regolo` Lua plugin.
 ///
 /// Loopback serves `<origin>/v1`, so the chat and `/models` requests land under
 /// `/v1` and the management endpoints at the root, which is what
@@ -734,7 +704,7 @@ mod tests {
 
     #[test]
     fn next_utc_midnight_is_following_day_start() {
-        let now = "2026-08-25T13:45:10Z".parse::<jiff::Timestamp>().unwrap();
+        let now = "2026-08-25T13:45:10Z".parse::<Timestamp>().unwrap();
         assert_eq!(next_utc_midnight(now), Some(1_787_702_400_000));
     }
 
@@ -782,7 +752,7 @@ mod tests {
         }
     ]}"#;
 
-    fn join_fixture(ids: &[&str]) -> Vec<crate::model::ModelInfo> {
+    fn join_fixture(ids: &[&str]) -> Vec<ModelInfo> {
         let groups: ModelGroupInfoResponse = serde_json::from_str(MODEL_GROUPS_FIXTURE).unwrap();
         join_model_info(
             ids.iter().map(|id| (*id).to_string()).collect(),
@@ -866,8 +836,8 @@ mod tests {
     }
 }
 
-/// Regolo as the bespoke `Regolo` puts it on the wire, recorded for the
-/// declaration that replaces it to replay.
+/// Regolo as [`decl`] plus [`hooks`] put it on the wire, one recorded exchange
+/// at a time.
 #[cfg(test)]
 mod replay_tests {
     use test_case::test_case;
@@ -886,16 +856,18 @@ mod replay_tests {
     #[test_case(&replay::MALFORMED_SSE ; "malformed_sse")]
     #[test_case(&replay::EMPTY_SSE_ERROR ; "empty_sse_error_frame")]
     #[test_case(&replay::TRUNCATED_STREAM ; "truncated_stream")]
-    fn the_bespoke_impl_records_the_exchange(fixture: &Fixture) {
-        replay::bespoke(SLUG).stream(fixture, &fixtures::model());
+    fn the_declaration_replays_the_recorded_exchange(fixture: &Fixture) {
+        replay::declared(replay::rust_authoring, SLUG, fixture, &fixtures::model());
     }
 
+    /// The golden pins both requests as well as the rows: the group call is
+    /// made after a good `/models` answer only, and its failure keeps the ids.
     #[test_case(&fixtures::MODELS ; "models")]
     #[test_case(&fixtures::MODELS_WITHOUT_GROUPS ; "models_without_groups")]
     #[test_case(&fixtures::MODELS_MALFORMED_GROUPS ; "models_malformed_groups")]
     #[test_case(&fixtures::MODELS_UNAUTHORIZED ; "models_unauthorized")]
-    fn the_bespoke_impl_records_the_catalogue(fixture: &Fixture) {
-        replay::bespoke(SLUG).models(fixture);
+    fn the_declaration_lists_the_recorded_catalogue(fixture: &Fixture) {
+        replay::declared_models(replay::rust_authoring, SLUG, fixture);
     }
 
     #[test_case(&fixtures::USAGE ; "usage")]
@@ -904,7 +876,7 @@ mod replay_tests {
     #[test_case(&fixtures::USAGE_SIDE_CALLS_FAIL ; "usage_side_calls_fail")]
     #[test_case(&fixtures::USAGE_SIDE_CALLS_MALFORMED ; "usage_side_calls_malformed")]
     #[test_case(&fixtures::USAGE_UNAUTHORIZED ; "usage_unauthorized")]
-    fn the_bespoke_impl_records_the_usage(fixture: &Fixture) {
-        replay::bespoke(SLUG).usage(fixture);
+    fn the_declaration_reads_the_recorded_usage(fixture: &Fixture) {
+        replay::declared_usage(replay::rust_authoring, SLUG, fixture);
     }
 }

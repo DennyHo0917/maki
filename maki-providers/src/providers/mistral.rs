@@ -1,22 +1,24 @@
 use std::borrow::Cow;
-use std::sync::{Arc, Mutex};
+use std::collections::BTreeMap;
+use std::sync::Arc;
 
-use flume::Sender;
-use maki_storage::id::SessionRef;
+use isahc::http::HeaderName;
 use serde_json::{Value, json};
 
 use maki_config::providers::{Protocol, ProviderPlan};
 
-use crate::model::{Model, ModelFamily, ThinkingSupport};
-use crate::provider::{BoxFuture, Provider};
+use crate::model::{ModelFamily, ModelInfo, ThinkingSupport};
+use crate::provider::BoxFuture;
 use crate::providers::aperture::DEFAULT_PATH_PREFIX;
-use crate::spec::{
-    ApertureRoute, AuthDoc, CatalogDoc, GeneratedDocs, LoginConfig, Native, ProviderSpec,
-};
-use crate::{AgentError, Message, ProviderEvent, RequestOptions, StreamResponse, dialect};
+use crate::spec::{ApertureRoute, AuthDoc, CatalogDoc, GeneratedDocs, LoginConfig, ProviderSpec};
+use crate::{AgentError, dialect};
 
+use super::Timeouts;
 use super::openai_compat::{MODELS_PATH, OpenAiCompatConfig, OpenAiCompatProvider};
-use super::{KeyHeader, KeyPool, KeyRotation, ResolvedAuth, Timeouts};
+use super::plugin::{
+    self, BodyInput, EffortField, Hook, OpenAiWire, ProviderDecl, ProviderHooks, SessionCarrier,
+    ThinkingWire,
+};
 
 const SLUG: &str = "mistral";
 const DISPLAY_NAME: &str = "Mistral";
@@ -26,6 +28,23 @@ const DEFAULT_MODEL: &str = "mistral/mistral-medium-latest";
 const CODING_MODEL: &str = "mistral/mistral-vibe-cli-latest";
 const LOGIN_URL: &str = "https://admin.mistral.ai/organization/api-keys";
 const MAX_TOKENS_FIELD: &str = "max_tokens";
+const NET_HOST: &str = "api.mistral.ai";
+const AFFINITY_HEADER: &str = "x-affinity";
+/// Mistral's small models, which the API refuses reasoning for whatever the
+/// model table says.
+const NO_THINKING_PREFIX: &str = "ministral-";
+
+const MESSAGES_FIELD: &str = "messages";
+const ROLE_FIELD: &str = "role";
+const ASSISTANT_ROLE: &str = "assistant";
+const REASONING_FIELD: &str = "reasoning_content";
+const CONTENT_FIELD: &str = "content";
+const ID_FIELD: &str = "id";
+const CAPABILITIES_FIELD: &str = "capabilities";
+const COMPLETION_CHAT_CAPABILITY: &str = "completion_chat";
+const REASONING_CAPABILITY: &str = "reasoning";
+const VISION_CAPABILITY: &str = "vision";
+const CONTEXT_WINDOW_FIELD: &str = "max_context_length";
 
 static CONFIG: OpenAiCompatConfig = OpenAiCompatConfig {
     slug: Cow::Borrowed(SLUG),
@@ -68,10 +87,7 @@ pub(crate) const SPEC: ProviderSpec = ProviderSpec {
     fallback_context_window: 128_000,
     models_toml: include_str!("../../models/mistral.toml"),
     pricing_schedule: None,
-    native: Some(Native {
-        new: create,
-        with_auth: create_with_auth,
-    }),
+    native: None,
     aperture: Some(ApertureRoute {
         path_prefix: DEFAULT_PATH_PREFIX,
     }),
@@ -92,197 +108,160 @@ pub(crate) const SPEC: ProviderSpec = ProviderSpec {
     },
 };
 
-fn create(timeouts: Timeouts) -> Result<Box<dyn Provider>, AgentError> {
-    Ok(Box::new(Mistral::new(timeouts)?))
-}
-
-fn create_with_auth(
-    auth: Arc<Mutex<ResolvedAuth>>,
-    timeouts: Timeouts,
-    system_prefix: Option<String>,
-) -> Box<dyn Provider> {
-    Box::new(Mistral::with_auth(auth, timeouts).with_system_prefix(system_prefix))
-}
-
 inventory::submit!(SPEC.config_row());
 
-pub struct Mistral {
-    compat: OpenAiCompatProvider,
-    auth: Arc<Mutex<ResolvedAuth>>,
-    key_pool: Option<KeyPool>,
-    system_prefix: Option<String>,
+/// Mistral as a declaration, plus the two things the openai codec cannot
+/// spell, see [`hooks`].
+///
+/// Only what the codec cannot guess is stated here. Claiming a built-in slug
+/// inherits the whole [`SPEC`] row, and `max_tokens` and streamed usage are
+/// already the codec's defaults. The small models' refusal to reason is data
+/// rather than a hook: `adjust_model` is synchronous, and the codec applies
+/// it on aperture's route onto this slug as well.
+///
+/// The bundled `mistral` Lua plugin says all of this again on the surface a
+/// third-party plugin uses, and outranks this at every real startup.
+pub(crate) fn decl() -> ProviderDecl {
+    ProviderDecl {
+        slug: SLUG.to_owned(),
+        display_name: None,
+        codec: Some(Protocol::Openai),
+        base: None,
+        base_url: Some(BASE_URL.to_owned()),
+        api_key_env: None,
+        system_prefix: None,
+        models: Vec::new(),
+        openai: Some(OpenAiWire {
+            thinking: Some(ThinkingWire {
+                dialect: &dialect::HIGH_ONLY,
+                field: EffortField::default(),
+                requires_support: false,
+            }),
+            session_id: Some(SessionCarrier::Header(HeaderName::from_static(
+                AFFINITY_HEADER,
+            ))),
+            thinking_overrides: BTreeMap::from([(
+                NO_THINKING_PREFIX.to_owned(),
+                ThinkingSupport::No,
+            )]),
+            ..OpenAiWire::default()
+        }),
+        net_hosts: vec![NET_HOST.to_owned()],
+    }
 }
 
+/// The two callbacks [`decl`] cannot spell, registered alongside it.
+pub(crate) fn hooks() -> ProviderHooks {
+    ProviderHooks {
+        build_body: Some(Arc::new(AssistantThinking)),
+        list_models: Some(Arc::new(Catalogue)),
+        ..ProviderHooks::default()
+    }
+}
+
+/// Mistral takes reasoning back as a `thinking` part of the assistant turn's
+/// `content`, not as the `reasoning_content` the openai codec writes.
+struct AssistantThinking;
+
+impl Hook<BodyInput, Value> for AssistantThinking {
+    fn call(&self, input: BodyInput) -> BoxFuture<'_, Result<Value, AgentError>> {
+        Box::pin(async move {
+            let mut body = input.body;
+            if let Some(messages) = body.get_mut(MESSAGES_FIELD) {
+                convert_assistant_messages_in_place(messages);
+            }
+            Ok(body)
+        })
+    }
+}
+
+/// Mistral's `/models`, which lists embedding, OCR and moderation models too
+/// and names its fields its own way.
+struct Catalogue;
+
+impl Hook<(), Vec<ModelInfo>> for Catalogue {
+    fn call(&self, (): ()) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
+        Box::pin(async move {
+            let auth = plugin::registered_auth(SLUG)?;
+            let compat = OpenAiCompatProvider::new(&CONFIG, Timeouts::default());
+            compat
+                .fetch_and_parse_models(&auth, MODELS_PATH, parse_model)
+                .await
+        })
+    }
+}
+
+/// Only chat-capable rows survive. `vision` defaults to off, where an unstated
+/// `reasoning` stays unstated.
+fn parse_model(m: &Value) -> Option<ModelInfo> {
+    let capabilities = m.get(CAPABILITIES_FIELD).and_then(Value::as_object)?;
+    let capability = |name: &str| capabilities.get(name).and_then(Value::as_bool);
+    if capability(COMPLETION_CHAT_CAPABILITY) != Some(true) {
+        return None;
+    }
+    Some(ModelInfo {
+        id: m[ID_FIELD].as_str()?.to_owned(),
+        context_window: m[CONTEXT_WINDOW_FIELD]
+            .as_u64()
+            .and_then(|v| u32::try_from(v).ok()),
+        supports_thinking: capability(REASONING_CAPABILITY),
+        supports_vision: Some(capability(VISION_CAPABILITY).unwrap_or(false)),
+        ..ModelInfo::default()
+    })
+}
+
+/// Moves each assistant turn's string `reasoning_content` to the front of its
+/// `content`, as a `thinking` part. A non-string one is dropped.
 fn convert_assistant_messages_in_place(messages: &mut Value) {
-    if let Some(msgs) = messages.as_array_mut() {
-        for msg in msgs {
-            if let Some(obj) = msg.as_object_mut()
-                && obj.get("role").and_then(Value::as_str) == Some("assistant")
-            {
-                let Some(reasoning_val) = obj.remove("reasoning_content") else {
-                    continue;
-                };
-                let Some(reasoning_text) = reasoning_val.as_str() else {
-                    continue;
-                };
-
-                let thinking_block = json!({
-                    "type": "thinking",
-                    "thinking": [{"type": "text", "text": reasoning_text}]
-                });
-
-                if let Some(content) = obj.get_mut("content") {
-                    if let Some(content_str) = content.as_str()
-                        && !content_str.is_empty()
-                    {
-                        // Has text content, create array with both
-                        let text_content = json!({"type": "text", "text": content_str});
-                        *content = json!([thinking_block, text_content]);
-                    } else if content.is_string() {
-                        // Empty string content, just use thinking
-                        *content = json!([thinking_block]);
-                    } else if let Some(arr) = content.as_array_mut() {
-                        // Already an array, prepend thinking
-                        arr.insert(0, thinking_block);
-                    } else {
-                        *content = json!([thinking_block]);
-                    }
-                } else {
-                    obj.insert("content".to_string(), json!([thinking_block]));
-                }
-            }
+    let Some(messages) = messages.as_array_mut() else {
+        return;
+    };
+    for msg in messages {
+        let Some(obj) = msg.as_object_mut() else {
+            continue;
+        };
+        if obj.get(ROLE_FIELD).and_then(Value::as_str) != Some(ASSISTANT_ROLE) {
+            continue;
         }
-    }
-}
-
-impl Mistral {
-    pub fn new(timeouts: super::Timeouts) -> Result<Self, AgentError> {
-        let pool = KeyPool::resolve("mistral", &CONFIG.api_key_env)?;
-        Ok(Self {
-            compat: OpenAiCompatProvider::new(&CONFIG, timeouts),
-            auth: Arc::new(Mutex::new(ResolvedAuth::bearer("mistral", pool.current())?)),
-            key_pool: Some(pool),
-            system_prefix: None,
-        })
-    }
-
-    pub(crate) fn with_auth(auth: Arc<Mutex<ResolvedAuth>>, timeouts: super::Timeouts) -> Self {
-        Self {
-            compat: OpenAiCompatProvider::new(&CONFIG, timeouts),
-            auth,
-            key_pool: None,
-            system_prefix: None,
-        }
-    }
-
-    pub(crate) fn with_system_prefix(mut self, prefix: Option<String>) -> Self {
-        self.system_prefix = prefix;
-        self
-    }
-}
-
-impl Provider for Mistral {
-    fn stream_message<'a>(
-        &'a self,
-        model: &'a Model,
-        messages: &'a [Message],
-        system: &'a str,
-        tools: &'a Value,
-        event_tx: &'a Sender<ProviderEvent>,
-        opts: RequestOptions,
-        session_id: Option<&'a SessionRef>,
-    ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
-        Box::pin(async move {
-            let auth = self.auth.lock().unwrap().clone();
-            let mut buf = String::new();
-            let system = super::with_prefix(&self.system_prefix, system, &mut buf);
-            let mut body = self.compat.build_body(model, messages, system, tools);
-            opts.thinking
-                .apply_reasoning_effort(&mut body, &dialect::HIGH_ONLY, model);
-            // Convert assistant messages to Mistral's expected format with thinking content
-            convert_assistant_messages_in_place(body.get_mut("messages").unwrap());
-
-            let mut extra_headers = vec![];
-            if let Some(session_id) = session_id {
-                extra_headers.push(("x-affinity", session_id.as_str()));
+        let Some(Value::String(reasoning)) = obj.remove(REASONING_FIELD) else {
+            continue;
+        };
+        let thinking = json!({
+            "type": "thinking",
+            "thinking": [{"type": "text", "text": reasoning}]
+        });
+        let content = match obj.remove(CONTENT_FIELD) {
+            Some(Value::String(text)) if !text.is_empty() => {
+                json!([thinking, {"type": "text", "text": text}])
             }
-            self.compat
-                .do_stream(model, &extra_headers, &body, event_tx, &auth)
-                .await
-        })
-    }
-
-    fn list_models(&self) -> BoxFuture<'_, Result<Vec<crate::model::ModelInfo>, AgentError>> {
-        Box::pin(async move {
-            let auth = self.auth.lock().unwrap().clone();
-            self.compat
-                .fetch_and_parse_models(&auth, MODELS_PATH, |m| {
-                    // Filter: only completion_chat capable models
-                    let has_completion_chat = m
-                        .get("capabilities")
-                        .and_then(Value::as_object)
-                        .and_then(|c| c.get("completion_chat"))
-                        .and_then(Value::as_bool)
-                        .unwrap_or(false);
-                    if !has_completion_chat {
-                        return None;
-                    }
-
-                    // Parse with Mistral-specific field names
-                    let id = m["id"].as_str()?;
-                    let context_window = m["max_context_length"]
-                        .as_u64()
-                        .and_then(|v| u32::try_from(v).ok());
-                    let supports_thinking = m
-                        .get("capabilities")
-                        .and_then(Value::as_object)
-                        .and_then(|c| c.get("reasoning"))
-                        .and_then(Value::as_bool);
-                    let supports_vision = m
-                        .get("capabilities")
-                        .and_then(Value::as_object)
-                        .and_then(|c| c.get("vision"))
-                        .and_then(Value::as_bool)
-                        .unwrap_or(false);
-                    Some(crate::model::ModelInfo {
-                        id: id.to_string(),
-                        context_window,
-                        max_output_tokens: None,
-                        pricing: None,
-                        supports_thinking,
-                        supports_vision: Some(supports_vision),
-                        tier: None,
-                        provider_info: None,
-                    })
-                })
-                .await
-        })
-    }
-
-    fn keys(&self) -> Option<KeyRotation<'_>> {
-        Some(KeyRotation::new(
-            self.key_pool.as_ref()?,
-            &self.auth,
-            KeyHeader::Bearer,
-        ))
-    }
-
-    fn adjust_model(&self, model: &mut Model) {
-        adjust_model(model);
-    }
-}
-
-fn adjust_model(model: &mut Model) {
-    if model.id.starts_with("ministral-") {
-        model.thinking_override = Some(ThinkingSupport::No);
+            Some(Value::Array(mut parts)) => {
+                parts.insert(0, thinking);
+                Value::Array(parts)
+            }
+            _ => json!([thinking]),
+        };
+        obj.insert(CONTENT_FIELD.to_owned(), content);
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use serde_json::{Value, json};
+    use std::sync::Mutex;
+
     use test_case::test_case;
+
+    use super::*;
+    use crate::model::Model;
+    use crate::provider::Provider;
+    use crate::providers::ResolvedAuth;
+    use crate::providers::aperture::Aperture;
+
+    const API_KEY: &str = "sk-test";
+    const APERTURE: &str = "aperture";
+    const MINISTRAL: &str = "ministral-14b-latest";
+    const MEDIUM: &str = "mistral-medium-latest";
+    const UNKNOWN_MODEL: &str = "the model spec did not resolve";
+    const NOT_BUILT: &str = "mistral did not build from its declaration";
 
     #[test_case(
         json!([
@@ -331,6 +310,30 @@ mod tests {
     )]
     #[test_case(
         json!([
+            {"role": "assistant", "content": [{"type": "text", "text": "text"}], "reasoning_content": "thinking"}
+        ]),
+        json!([
+            {
+                "role": "assistant",
+                "content": [
+                    {"type": "thinking", "thinking": [{"type": "text", "text": "thinking"}]},
+                    {"type": "text", "text": "text"}
+                ]
+            }
+        ])
+        ; "assistant_array_content_with_thinking"
+    )]
+    #[test_case(
+        json!([
+            {"role": "assistant", "content": "text", "reasoning_content": null}
+        ]),
+        json!([
+            {"role": "assistant", "content": "text"}
+        ])
+        ; "assistant_null_reasoning_dropped"
+    )]
+    #[test_case(
+        json!([
             {"role": "system", "content": "sys"},
             {"role": "assistant", "content": "text"}
         ]),
@@ -340,24 +343,54 @@ mod tests {
         ])
         ; "assistant_text_only_no_thinking"
     )]
-    fn convert_assistant_messages_in_place_test(input: Value, expected: Value) {
-        let mut input_clone = input.clone();
-        convert_assistant_messages_in_place(&mut input_clone);
-        assert_eq!(input_clone, expected);
+    fn convert_assistant_messages_in_place_test(mut messages: Value, expected: Value) {
+        convert_assistant_messages_in_place(&mut messages);
+        assert_eq!(messages, expected);
     }
 
-    #[test_case("mistral/ministral-14b-latest", false ; "ministral_no_thinking")]
-    #[test_case("mistral/mistral-medium-latest", true ; "mistral_medium_supports_thinking")]
-    fn adjust_model_sets_thinking_support(spec: &str, expected: bool) {
-        let mut model = Model::from_spec(spec).unwrap();
-        adjust_model(&mut model);
-        assert_eq!(model.supports_thinking(), expected);
+    fn declared(model_id: &str) -> Model {
+        let mut model = Model::from_spec(&format!("{SLUG}/{model_id}")).expect(UNKNOWN_MODEL);
+        plugin::create(SLUG, Timeouts::default())
+            .expect(NOT_BUILT)
+            .adjust_model(&mut model);
+        model
+    }
+
+    fn routed(model_id: &str) -> Model {
+        let mut model =
+            Model::from_spec(&format!("{APERTURE}/{SLUG}/{model_id}")).expect(UNKNOWN_MODEL);
+        let auth = Arc::new(Mutex::new(ResolvedAuth::for_test(None, Vec::new())));
+        Aperture::with_auth(auth, Timeouts::default()).adjust_model(&mut model);
+        model
+    }
+
+    /// The override is declared data the codec applies, so aperture's route
+    /// onto the slug, which builds that same codec, has to honour it too.
+    #[test_case(declared, MINISTRAL, false ; "declared_ministral")]
+    #[test_case(routed, MINISTRAL, false ; "aperture_ministral")]
+    #[test_case(declared, MEDIUM, true ; "declared_medium")]
+    #[test_case(routed, MEDIUM, true ; "aperture_medium")]
+    fn only_ministral_is_denied_thinking(
+        adjusted: fn(&str) -> Model,
+        model_id: &str,
+        thinks: bool,
+    ) {
+        unsafe { std::env::set_var(ENV_VAR, API_KEY) };
+        plugin::begin_load();
+        plugin::commit_load();
+
+        let model = adjusted(model_id);
+        assert_eq!(
+            model.thinking_override == Some(ThinkingSupport::No),
+            !thinks
+        );
+        assert_eq!(model.supports_thinking(), thinks);
     }
 }
 
 /// The recorded cases, kept out of the test module so both authorings replay
-/// the same list once the port lands. Every golden is recorded against the
-/// bespoke [`Mistral`] impl above.
+/// the same list: [`decl`] plus [`hooks`], and the bundled `mistral` Lua
+/// plugin.
 #[cfg(any(test, feature = "test-support"))]
 pub mod fixtures {
     use serde_json::json;
@@ -551,7 +584,8 @@ data: [DONE]
     }
 }
 
-/// Mistral as the bespoke impl puts it on the wire, recorded for the port.
+/// Mistral as [`decl`] plus [`hooks`] put it on the wire, one recorded
+/// exchange at a time.
 #[cfg(test)]
 mod replay_tests {
     use test_case::test_case;
@@ -573,18 +607,27 @@ mod replay_tests {
     #[test_case(&replay::MALFORMED_SSE ; "malformed_sse")]
     #[test_case(&replay::EMPTY_SSE_ERROR ; "empty_sse_error_frame")]
     #[test_case(&replay::TRUNCATED_STREAM ; "truncated_stream")]
-    fn the_bespoke_impl_records_the_exchange(fixture: &Fixture) {
-        replay::bespoke(SLUG).stream(fixture, &model());
+    fn the_declaration_replays_the_recorded_exchange(fixture: &Fixture) {
+        replay::declared(replay::rust_authoring, SLUG, fixture, &model());
     }
 
+    /// The assistant-turn rewrite on the wire, which needs a history to act
+    /// on: the fixtures above send one user turn.
     #[test]
-    fn the_bespoke_impl_records_the_history() {
-        replay::bespoke(SLUG).with(&HISTORY, &model(), &history(), &replay::tools());
+    fn the_declaration_rewrites_the_same_turns() {
+        replay::declared_with(
+            replay::rust_authoring,
+            SLUG,
+            &HISTORY,
+            &model(),
+            &history(),
+            &replay::tools(),
+        );
     }
 
     #[test_case(&MODELS ; "models")]
     #[test_case(&MODELS_UNAUTHORIZED ; "models_unauthorized")]
-    fn the_bespoke_impl_records_the_listing(fixture: &Fixture) {
-        replay::bespoke(SLUG).models(fixture);
+    fn the_declaration_lists_the_recorded_models(fixture: &Fixture) {
+        replay::declared_models(replay::rust_authoring, SLUG, fixture);
     }
 }

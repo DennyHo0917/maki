@@ -3566,7 +3566,8 @@ if m and m.subsidised_by then print(m.subsidised_by, m.pricing.input) end
 HTTP client for fetching web content. All traffic goes over HTTPS
 (plain HTTP is upgraded). Private and metadata IP addresses are
 blocked to prevent SSRF, including after a redirect. Hosts listed in
-the `net.allowed_private_hosts` config option are exempt.
+the `net.allowed_private_hosts` config option are exempt, and so is a
+provider plugin's own origin (see `maki.net.request`).
 Failed requests (5xx) are retried automatically.
 
 ```lua
@@ -3587,11 +3588,18 @@ URLs are automatically upgraded to `https://`. Requests to private
 or metadata IP addresses are blocked for safety, unless the host is
 listed in `net.allowed_private_hosts`.
 
+A request to the origin of a provider this plugin registered, as the
+user (`<SLUG>_BASE_URL`, `providers.toml`) or maki (a built-in's
+default) chose it, goes out the way the provider's chat requests do:
+no address check or upgrade, maki's user agent, and connect and stall
+timeouts instead of a total one.
+
 {opts} fields:
   `method` (string) HTTP verb (default `"GET"`).
   `headers` (table) Header name/value pairs.
   `body` (string) Request body.
-  `timeout` (integer) Timeout in seconds, max 120 (default 30).
+  `timeout` (integer) Total timeout in seconds, max 120 (default 30,
+    none on a provider's origin).
   `max_bytes` (integer) Max response size in bytes (default 5 MB).
   `retry` (integer) Retries on 5xx errors (default 3).
 
@@ -3769,10 +3777,19 @@ the `google` codec, which drops it. So does a key this list does not name.
   `list_models` (function) `function()` returning a list of model rows,
            for a provider whose catalogue is only known at runtime. Rows
            carry `id`, `context_window`, `max_output_tokens`, `pricing`,
-           `supports_thinking`, `supports_vision` and `tier`.
+           `supports_thinking`, `supports_vision` and `tier`. Two more
+           are optional. `extra` is any JSON value the plugin wants back
+           when the model is used. `effort` narrows the declared
+           `openai.thinking` dialect for this model: `supported` lists
+           its effort names as the provider spells them (names maki has
+           no level for are dropped, an empty list keeps the dialect's
+           levels), and `send_off` is `true` to send `"none"` for off,
+           `false` to send nothing, or omitted to keep the dialect's way.
   `build_body` (function) `function(body, model, opts)` returning the
            request body to send. `opts.thinking` is the effort level as
-           rendered. Only for the `openai` codecs.
+           rendered. `opts.model_info` is the `extra` this provider's
+           `list_models` attached to the model, nil when it attached none
+           or the model was never listed. Only for the `openai` codecs.
   `map_error` (function) `function(status, message)` returning
            `{ status = ..., message = ... }`, or nil to keep the original.
            Those two fields are all it may change: `retry_after` comes from
@@ -6902,12 +6919,44 @@ function M.cut(view, out, reason, timeout_secs)
 -- nil. Tables that did not come from `M.decode` carry no float marks, so there
 -- a whole-valued float passes as an integer.
 --
+-- A JSON null decodes to nil, which looks like a missing key and leaves a hole
+-- that stops `#` and `ipairs` early. `M.decode` also remembers where the nulls
+-- were: `M.is_null` tells them from missing keys, and `M.items` walks an array
+-- the way Rust's `as_array().iter()` does, nulls included.
+--
+-- `M.get_json` and `M.models` are the two halves of the Rust side's
+-- `fetch_and_parse_models`, for a hook that fetches off the codec's request
+-- path.
+--
 -- Luau numbers are doubles: a u64 above 2^53 comes back rounded, and
 -- u64::MAX reads as 2^64.
 
 --- `maki.json.decode`, plus a record of which numbers serde_json would read
---- as floats. Returns the value, or nil and an error.
+--- as floats and where the nulls were. Returns the value, or nil and an error.
 function M.decode(text)
+
+--- serde_json `tbl.get(key).is_some_and(Value::is_null)`: true only where the
+--- decoded JSON held a null, never for a missing key or a table that did not
+--- come from `M.decode`.
+function M.is_null(tbl, key)
+
+--- The JSON array's length, nulls included. `#arr` for a table that did not
+--- come from `M.decode`, 0 for a non-table.
+function M.len(arr)
+
+--- Rust `as_array().iter().enumerate()`, 1-based: `for i, v in M.items(arr)`
+--- visits every index up to `M.len(arr)`, with v nil for a null element.
+function M.items(arr)
+
+--- Rust `get_text` then `serde_json::from_str`: a GET with the provider's
+--- resolved `auth`, never retried. Returns the decoded body, nil for a JSON
+--- null. On failure returns nil and an error for `M.fail`.
+function M.get_json(auth, url)
+
+--- Hands a `M.get_json` error back from a hook. A refused request is returned,
+--- so it fails the way the native provider does. Anything else never got an
+--- HTTP status and is raised.
+function M.fail(err)
 
 --- serde_json `Value::as_u64` on `tbl[key]`: a non-negative integer, never a
 --- float such as `1.0`, `1e3` or `-0`.
@@ -6918,6 +6967,9 @@ function M.as_u32(tbl, key)
 
 --- serde_json `Value::as_f64` on `tbl[key]`: any number, integer or float.
 function M.as_f64(tbl, key)
+
+--- serde_json `Value::as_bool` on `tbl[key]`.
+function M.as_bool(tbl, key)
 
 --- Rust `s.parse::<f64>().ok()`: no whitespace, no hex, an optional sign,
 --- and `inf`, `infinity` or `nan` in any case. nil for a non-string.
@@ -6940,6 +6992,11 @@ function M.fixed(x, n)
 --- Rust `sort_by`, in place: stable, so elements that are not `less` than
 --- each other keep their order. `less(a, b)` is true when `a` sorts first.
 function M.stable_sort_by(list, less)
+
+--- The rest of Rust `fetch_and_parse_models`: each `body.data` element through
+--- `parse_row`, nils dropped, sorted by `id`. A body without a `data` array
+--- lists nothing.
+function M.models(body, parse_row)
 ```
 
 ### `require("maki.scroll")`

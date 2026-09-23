@@ -5,6 +5,7 @@
 //! needs its own, and `cargo nextest` is what gives a test its own process.
 
 use maki_config::providers::Protocol;
+use maki_providers::Timeouts;
 use maki_providers::plugin::{
     self, DeclAuthority, DeclSource, ProviderDecl, RegisterError, Registration,
 };
@@ -26,6 +27,9 @@ const PROVIDERS_FILE: &str = "providers.toml";
 const CLAIMED_SLUG: &str = "deepseek";
 const GATEWAY_URL: &str = "https://gateway.example/v1";
 
+const GATEWAY_HEADER: &str = "X-Gateway-Key";
+const UNSET_VAR: &str = "MAKI_TEST_UNSET_GATEWAY_KEY";
+
 const OWN_SLUG: &str = "configured-provider";
 const OWN_PROTOCOL: &str = "openai";
 const OWN_BASE_URL: &str = "https://configured.example/v1";
@@ -36,6 +40,7 @@ const TEMPDIR_FAILED: &str = "no temporary state directory";
 const CONFIG_DIR_FAILED: &str = "the isolated config directory did not resolve";
 const WRITE_FAILED: &str = "providers.toml could not be written";
 const PROVIDER_LOST: &str = "a providers.toml overlay took the slug off its declaration";
+const BUILT_DESPITE_BAD_HEADER: &str = "a bad [<slug>.headers] must fail the build";
 
 /// Points every base directory at a throwaway tree holding `providers.toml`,
 /// so no case reads this machine's config. The file goes wherever maki's own
@@ -87,6 +92,32 @@ fn an_overlay_on_a_built_in_slug_keeps_the_declaration() {
     assert_eq!(
         plugin::effective_base_url(CLAIMED_SLUG).as_deref(),
         Some(GATEWAY_URL)
+    );
+}
+
+/// A bad `[<builtin>.headers]` fails that provider when it is built, the way a
+/// native constructor did, and not the bundled load: that would keep maki from
+/// starting over a provider the user may never pick.
+#[test]
+fn a_bad_header_on_a_built_in_slug_fails_only_its_build() {
+    let _home = isolated(&format!(
+        "[{CLAIMED_SLUG}.headers]\n\"{GATEWAY_HEADER}\" = \"${{{UNSET_VAR}}}\"\n"
+    ));
+    unsafe { std::env::remove_var(UNSET_VAR) };
+    plugin::begin_load();
+    plugin::commit_load();
+
+    assert!(
+        matches!(Owner::of(CLAIMED_SLUG), Owner::Plugin),
+        "{PROVIDER_LOST}"
+    );
+    let error = plugin::create(CLAIMED_SLUG, Timeouts::default())
+        .err()
+        .expect(BUILT_DESPITE_BAD_HEADER)
+        .to_string();
+    assert!(
+        error.contains(GATEWAY_HEADER) && error.contains(UNSET_VAR),
+        "{error}"
     );
 }
 

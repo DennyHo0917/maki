@@ -22,7 +22,6 @@ pub use model::{
     ThinkingOption, ThinkingSupport, TokenUsage, format_tokens,
 };
 pub use pricing::{model_cost, settle_session};
-pub use providers::Timeouts;
 pub use providers::catalog::ProviderData;
 pub use providers::catalog::{
     catalog_provider, catalog_provider_if_available, catalog_providers,
@@ -33,6 +32,7 @@ pub use providers::openai::auth as openai_auth;
 pub use providers::plugin;
 pub use providers::xai::auth as xai_auth;
 pub use providers::{KeyHeader, KeyPool, KeyRotation, ResolvedAuth};
+pub use providers::{Timeouts, user_agent};
 /// The golden replay harness and the recorded cases of every ported provider,
 /// published on the same terms as [`test_support`] and for the same reason:
 /// the authoring that ships is a Lua plugin, which only `maki-lua` can stage,

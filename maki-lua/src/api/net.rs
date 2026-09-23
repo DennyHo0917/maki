@@ -10,6 +10,7 @@ use isahc::http::HeaderMap;
 use isahc::{AsyncBody, HttpClient, Request, Response};
 
 use maki_lua_macro::{lua_fn, lua_table};
+use maki_providers::Timeouts;
 use mlua::{Lua, Result as LuaResult, Table};
 use smol::{Timer, unblock};
 use url::Url;
@@ -196,14 +197,45 @@ struct RequestParams {
     method: String,
     headers: Vec<(String, String)>,
     body: Vec<u8>,
-    timeout: Duration,
+    /// The caller's own total bound, when it stated one.
+    timeout: Option<Duration>,
     max_bytes: usize,
     retries: u32,
-    /// `None` when the guard reached its verdict without DNS.
-    pin: Option<DnsPin>,
+    route: Route,
     /// Carried rather than passed, so every hop is vetted against the same
     /// reach the first one was.
     egress: NetEgress,
+}
+
+/// Which rules a hop goes out under, settled by [`vet`] again for every hop.
+#[derive(Debug)]
+enum Route {
+    /// The origin of a provider this plugin registered, as the user or maki
+    /// chose it. Reached on the terms the codec's own requests there run
+    /// under: no guard, maki's user agent, and connect and stall bounds
+    /// instead of a total one.
+    Provider,
+    /// Anywhere else, behind the guard. `None` when the guard reached its
+    /// verdict without DNS, so there is no address to pin.
+    Guarded(Option<DnsPin>),
+}
+
+impl Route {
+    /// The total bound a caller that stated none gets. A provider's origin has
+    /// none, like the codec's requests: its stall bound catches a dead server.
+    fn default_timeout(&self) -> Option<Duration> {
+        match self {
+            Self::Provider => None,
+            Self::Guarded(_) => Some(Duration::from_secs(DEFAULT_TIMEOUT_SECS)),
+        }
+    }
+
+    fn user_agents(&self) -> (&'static str, Option<&'static str>) {
+        match self {
+            Self::Provider => (maki_providers::user_agent(), None),
+            Self::Guarded(_) => (USER_AGENT, Some(FALLBACK_USER_AGENT)),
+        }
+    }
 }
 
 struct ResponseData {
@@ -248,11 +280,18 @@ fn collect_headers(headers: &HeaderMap) -> Vec<(String, String)> {
 /// or metadata IP addresses are blocked for safety, unless the host is
 /// listed in `net.allowed_private_hosts`.
 ///
+/// A request to the origin of a provider this plugin registered, as the
+/// user (`<SLUG>_BASE_URL`, `providers.toml`) or maki (a built-in's
+/// default) chose it, goes out the way the provider's chat requests do:
+/// no address check or upgrade, maki's user agent, and connect and stall
+/// timeouts instead of a total one.
+///
 /// {opts} fields:
 ///   `method` (string) HTTP verb (default `"GET"`).
 ///   `headers` (table) Header name/value pairs.
 ///   `body` (string) Request body.
-///   `timeout` (integer) Timeout in seconds, max 120 (default 30).
+///   `timeout` (integer) Total timeout in seconds, max 120 (default 30,
+///     none on a provider's origin).
 ///   `max_bytes` (integer) Max response size in bytes (default 5 MB).
 ///   `retry` (integer) Retries on 5xx errors (default 3).
 ///
@@ -289,7 +328,8 @@ lua_table! {
     /// HTTP client for fetching web content. All traffic goes over HTTPS
     /// (plain HTTP is upgraded). Private and metadata IP addresses are
     /// blocked to prevent SSRF, including after a redirect. Hosts listed in
-    /// the `net.allowed_private_hosts` config option are exempt.
+    /// the `net.allowed_private_hosts` config option are exempt, and so is a
+    /// provider plugin's own origin (see `maki.net.request`).
     /// Failed requests (5xx) are retried automatically.
     ///
     /// ```lua
@@ -318,15 +358,23 @@ fn check_declared_host(url: &str, egress: &NetEgress) -> Result<(), String> {
 /// the plugin's declared hosts, in that order, because the last one wants the
 /// address the guard settled on. One door, so a redirect cannot reach what the
 /// URL the caller wrote could not.
+///
+/// The origin of a provider the plugin registered skips all three, when the
+/// user or maki chose it: the codec already goes there unguarded.
 async fn vet(
     url: &str,
     allowed: &HostAllowlist,
     egress: &NetEgress,
-) -> Result<(String, Option<DnsPin>), String> {
+) -> Result<(String, Route), String> {
+    if let Ok(parsed) = Url::parse(url)
+        && egress.vouches(&parsed)
+    {
+        return Ok((parsed.into(), Route::Provider));
+    }
     let url = validate_and_upgrade_url(url, allowed)?;
     let pin = check_ssrf(&url, allowed).await?;
     check_declared_host(&url, egress)?;
-    Ok((url, pin))
+    Ok((url, Route::Guarded(pin)))
 }
 
 async fn extract_request_params(
@@ -335,7 +383,7 @@ async fn extract_request_params(
     opts: Option<&Table>,
 ) -> Result<RequestParams, String> {
     let allowed = ALLOWED_PRIVATE_HOSTS.load_full();
-    let (url, pin) = vet(url, &allowed, &egress).await?;
+    let (url, route) = vet(url, &allowed, &egress).await?;
 
     let method = opts
         .and_then(|o| o.get::<String>("method").ok())
@@ -357,11 +405,9 @@ async fn extract_request_params(
         .map(|s| s.into_bytes())
         .unwrap_or_default();
 
-    let timeout = Duration::from_secs(
-        opts.and_then(|o| o.get::<u64>("timeout").ok())
-            .unwrap_or(DEFAULT_TIMEOUT_SECS)
-            .min(MAX_TIMEOUT_SECS),
-    );
+    let timeout = opts
+        .and_then(|o| o.get::<u64>("timeout").ok())
+        .map(|secs| Duration::from_secs(secs.min(MAX_TIMEOUT_SECS)));
 
     let max_bytes = opts
         .and_then(|o| o.get::<usize>("max_bytes").ok())
@@ -379,7 +425,7 @@ async fn extract_request_params(
         timeout,
         max_bytes,
         retries,
-        pin,
+        route,
         egress,
     })
 }
@@ -423,13 +469,14 @@ async fn send_with_retries(
     params: &RequestParams,
 ) -> Result<Response<AsyncBody>, String> {
     let is_get = params.method.eq_ignore_ascii_case("GET");
+    let (user_agent, fallback_user_agent) = params.route.user_agents();
     let mut last_err = String::new();
 
     'retry: {
         for attempt in 0..=params.retries {
             let req = build_request(
                 &params.url,
-                USER_AGENT,
+                user_agent,
                 &params.method,
                 &params.headers,
                 params.body.clone(),
@@ -444,10 +491,13 @@ async fn send_with_retries(
                             .and_then(|v| v.to_str().ok())
                             .is_some_and(|v| v.contains(CF_CHALLENGE));
 
-                    if is_cf_challenge && is_get {
+                    if is_cf_challenge
+                        && is_get
+                        && let Some(fallback_user_agent) = fallback_user_agent
+                    {
                         let req = build_request(
                             &params.url,
-                            FALLBACK_USER_AGENT,
+                            fallback_user_agent,
                             &params.method,
                             &params.headers,
                             params.body.clone(),
@@ -496,7 +546,6 @@ fn redirect_location(response: &Response<AsyncBody>) -> Option<String> {
 /// The pin changes with every redirect, so the client has to as well.
 fn build_client(params: &RequestParams) -> Result<HttpClient, String> {
     let mut builder = HttpClient::builder()
-        .timeout(params.timeout)
         // Redirects are followed by hand, so every hop goes through the SSRF
         // check. Left to curl, a URL that passed the check could still bounce
         // us into 169.254.169.254.
@@ -506,10 +555,17 @@ fn build_client(params: &RequestParams) -> Result<HttpClient, String> {
         // than change how every one of them is negotiated.
         .version_negotiation(VersionNegotiation::http11());
 
-    // Connect to the address the guard vetted instead of asking DNS again and
-    // trusting whatever the second answer says.
-    if let Some(pin) = &params.pin {
-        builder = builder.dns_resolve(ResolveMap::new().add(&pin.host, pin.port, pin.addr));
+    if let Some(timeout) = params.timeout.or(params.route.default_timeout()) {
+        builder = builder.timeout(timeout);
+    }
+    match &params.route {
+        Route::Provider => builder = Timeouts::default().bound(builder),
+        // Connect to the address the guard vetted instead of asking DNS again
+        // and trusting whatever the second answer says.
+        Route::Guarded(Some(pin)) => {
+            builder = builder.dns_resolve(ResolveMap::new().add(&pin.host, pin.port, pin.addr));
+        }
+        Route::Guarded(None) => {}
     }
 
     builder.build().map_err(|e| format!("client error: {e}"))
@@ -586,7 +642,7 @@ impl RequestParams {
         let target = base
             .join(location)
             .map_err(|e| format!("invalid redirect to {location}: {e}"))?;
-        let (target, pin) = vet(target.as_str(), allowed, &self.egress).await?;
+        let (target, route) = vet(target.as_str(), allowed, &self.egress).await?;
 
         let landed =
             Url::parse(&target).map_err(|e| format!("invalid redirect to {location}: {e}"))?;
@@ -607,7 +663,7 @@ impl RequestParams {
             self.body.clear();
         }
         self.url = target;
-        self.pin = pin;
+        self.route = route;
         Ok(())
     }
 }
@@ -920,10 +976,10 @@ mod tests {
             method: "GET".to_string(),
             headers: Vec::new(),
             body: Vec::new(),
-            timeout: Duration::from_secs(DEFAULT_TIMEOUT_SECS),
+            timeout: None,
             max_bytes: DEFAULT_MAX_BYTES,
             retries: 0,
-            pin: None,
+            route: Route::Guarded(None),
             egress: NetEgress::default(),
         }
     }
@@ -954,11 +1010,11 @@ mod tests {
     #[test]
     fn a_followed_redirect_replaces_the_pin() {
         let mut params = redirect_params(LOOPBACK_PORT_URL);
-        params.pin = Some(DnsPin {
+        params.route = Route::Guarded(Some(DnsPin {
             host: LOCALHOST_ENTRY.to_string(),
             port: ALLOWED_PORT,
             addr: IpAddr::V4(Ipv4Addr::LOCALHOST),
-        });
+        }));
         redirect(
             &mut params,
             302,
@@ -966,7 +1022,11 @@ mod tests {
             &allowlist(&[LOOPBACK_PORT_ENTRY]),
         )
         .unwrap();
-        assert!(params.pin.is_none(), "{:?}", params.pin);
+        assert!(
+            matches!(params.route, Route::Guarded(None)),
+            "{:?}",
+            params.route
+        );
     }
 
     #[test]
@@ -1202,7 +1262,10 @@ mod tests {
         assert_eq!(params.method, "GET");
         assert!(params.headers.is_empty());
         assert!(params.body.is_empty());
-        assert_eq!(params.timeout, Duration::from_secs(DEFAULT_TIMEOUT_SECS));
+        assert_eq!(
+            params.timeout.or(params.route.default_timeout()),
+            Some(Duration::from_secs(DEFAULT_TIMEOUT_SECS))
+        );
         assert_eq!(params.max_bytes, DEFAULT_MAX_BYTES);
         assert_eq!(params.retries, MAX_RETRIES);
     }
@@ -1213,7 +1276,7 @@ mod tests {
         let opts = lua.create_table().unwrap();
         opts.set("timeout", MAX_TIMEOUT_SECS + 100).unwrap();
         let params = request_params(PUBLIC_URL, Some(&opts)).unwrap();
-        assert_eq!(params.timeout, Duration::from_secs(MAX_TIMEOUT_SECS));
+        assert_eq!(params.timeout, Some(Duration::from_secs(MAX_TIMEOUT_SECS)));
     }
 
     #[test]

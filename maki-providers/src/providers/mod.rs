@@ -55,7 +55,7 @@ fn bearer_value(api_key: &str) -> String {
     format!("{BEARER_PREFIX}{api_key}")
 }
 
-pub(crate) fn user_agent() -> &'static str {
+pub fn user_agent() -> &'static str {
     concat!(
         "maki/v",
         env!("CARGO_PKG_VERSION"),
@@ -188,6 +188,17 @@ impl ResolvedAuth {
             .iter()
             .find(|(name, _)| name.eq_ignore_ascii_case(AUTHORIZATION_HEADER))
             .and_then(|(_, value)| value.strip_prefix(BEARER_PREFIX))
+    }
+
+    /// No credentials, not even `[<slug>.headers]`: what an auth cell holds
+    /// until its declaration's credentials resolve. Never sent, since
+    /// `plugin::create` resolves the headers again first.
+    pub(crate) fn withheld() -> Self {
+        Self {
+            base_url: None,
+            headers: Vec::new(),
+            config_headers: Vec::new(),
+        }
     }
 
     pub fn bearer(slug: &str, api_key: &str) -> Result<Self, AgentError> {
@@ -373,10 +384,19 @@ pub(crate) async fn next_sse_line<R: AsyncBufRead + Unpin>(
     result
 }
 
+impl Timeouts {
+    /// The connect and stall bounds every request to a provider runs under.
+    /// No total cap: a slow but moving download is not a dead one.
+    pub fn bound<C: Configurable>(&self, client: C) -> C {
+        client
+            .connect_timeout(self.connect)
+            .low_speed_timeout(LOW_SPEED_BYTES_PER_SEC, self.low_speed)
+    }
+}
+
 pub(crate) fn http_client(timeouts: Timeouts) -> isahc::HttpClient {
-    isahc::HttpClient::builder()
-        .connect_timeout(timeouts.connect)
-        .low_speed_timeout(LOW_SPEED_BYTES_PER_SEC, timeouts.low_speed)
+    timeouts
+        .bound(isahc::HttpClient::builder())
         // The workspace enables curl's http2 feature for OTLP over gRPC, which
         // would otherwise flip provider streaming to h2 over TLS. Streaming is
         // tuned for HTTP/1.1, so pin it.

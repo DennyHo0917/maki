@@ -333,7 +333,7 @@ A registration sets exactly one of `codec` and `base`. Setting both, or neither,
 | `anthropic` | Anthropic messages |
 | `google` | Gemini `generateContent` |
 
-`base` names a native provider and borrows that provider's whole adapter, quirks included: Mistral's dialect, Ollama's handling of the thinking field, Copilot's endpoint routing. It exists for people moving an old provider script over, where `base` was the only way to describe a provider. A new provider is better off with a codec, because a base can change behaviour whenever the provider it names does, and the list of bases keeps shrinking as those providers move to declarations of their own. Valid values: {}.
+`base` names a native provider and borrows that provider's whole adapter, quirks included: Ollama's handling of the thinking field, Copilot's endpoint routing. It exists for people moving an old provider script over, where `base` was the only way to describe a provider. A new provider is better off with a codec, because a base can change behaviour whenever the provider it names does, and the list of bases keeps shrinking as those providers move to declarations of their own. Valid values: {}.
 
 Either choice also supplies defaults. A registration with no `models` table borrows the catalog of its codec or base.
 

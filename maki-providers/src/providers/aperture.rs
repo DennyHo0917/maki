@@ -332,6 +332,8 @@ fn parse_models(body: &Value, overrides: &Overrides) -> Vec<ModelInfo> {
                 supports_vision: ov.supports_vision,
                 tier: None,
                 provider_info: None,
+                extra: None,
+                effort: None,
             })
         })
         .collect()

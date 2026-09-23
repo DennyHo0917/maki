@@ -128,10 +128,6 @@ pub struct RequestCtx<'a> {
     pub session: Option<&'a SessionRef>,
     /// What discovery reported for this model under this slug, looked up once
     /// here rather than by each pass that needs it.
-    #[expect(
-        dead_code,
-        reason = "read once the per-model refinements land (`ModelInfo.extra`, `ModelInfo.effort`)"
-    )]
     pub discovered: Option<ModelInfo>,
 }
 
@@ -217,11 +213,17 @@ impl OpenAiWire {
 }
 
 impl ThinkingWire {
+    /// The declared dialect, narrowed by what discovery listed for the model,
+    /// renders the effort: one snap, against the levels the model accepts.
     fn apply(&self, body: &mut Value, ctx: &RequestCtx) {
         if self.requires_support && !ctx.model.supports_thinking() {
             return;
         }
-        if let Some(effort) = ctx.opts.thinking.effort_str(self.dialect, ctx.model)
+        let dialect = match ctx.discovered.as_ref().and_then(|row| row.effort.as_ref()) {
+            Some(effort) => effort.refine(self.dialect),
+            None => self.dialect.clone(),
+        };
+        if let Some(effort) = ctx.opts.thinking.effort_str(&dialect, ctx.model)
             && let Some(object) = body.as_object_mut()
         {
             self.field.write(object, effort);
@@ -230,7 +232,7 @@ impl ThinkingWire {
 }
 
 impl EffortField {
-    fn parse(path: &str) -> Result<Self, WireError> {
+    pub(crate) fn parse(path: &str) -> Result<Self, WireError> {
         let keys: Box<[String]> = path
             .split(EFFORT_PATH_SEPARATOR)
             .map(str::to_owned)
@@ -563,6 +565,7 @@ mod tests {
     use super::super::plugin::PluginAuth;
     use super::super::synthetic;
     use super::*;
+    use crate::model::ModelEffort;
     use crate::{Effort, ThinkingConfig};
 
     const TITLE_HEADER: &str = "X-Title";
@@ -750,6 +753,33 @@ mod tests {
         );
 
         assert_eq!(body.get(DEFAULT_EFFORT_FIELD).is_some(), sent, "{body}");
+    }
+
+    /// A listed model's levels replace the declared ones before the one snap,
+    /// so a level past the declared ceiling still goes out.
+    #[test_case(Some(vec![Effort::High, Effort::XHigh]), "xhigh" ; "listed_levels_refine_the_dialect")]
+    #[test_case(None, "high" ; "unlisted_model_keeps_the_declared_dialect")]
+    fn a_discovered_effort_refines_the_declared_dialect(
+        listed: Option<Vec<Effort>>,
+        expected: &str,
+    ) {
+        let wire = wire(json!({ "thinking": { "dialect": "prefer-high" } })).unwrap();
+        let model = synthetic::fixtures::model();
+        let ctx = RequestCtx {
+            discovered: Some(ModelInfo {
+                effort: listed.map(|supported| ModelEffort {
+                    supported,
+                    send_off: None,
+                }),
+                ..ModelInfo::id_only(model.id.clone())
+            }),
+            ..ctx(&model, ThinkingConfig::Effort(Effort::Max))
+        };
+        let mut body = json!({});
+
+        wire.apply_body(&mut body, &ctx);
+
+        assert_eq!(body[DEFAULT_EFFORT_FIELD], expected);
     }
 
     #[test_case("ministral-8b-latest", Some(ThinkingSupport::No) ; "shorter_prefix")]

@@ -169,6 +169,8 @@ impl PlanModel {
                 .then(|| self.input_modalities.iter().any(|m| m == IMAGE_MODALITY)),
             tier: None,
             provider_info: Some(Arc::new(info)),
+            extra: None,
+            effort: None,
         }
     }
 }

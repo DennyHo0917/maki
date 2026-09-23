@@ -4,6 +4,8 @@
 -- those here, or the codec's own max tokens field and stream usage, is a
 -- registration error rather than an override.
 
+local parse = require("maki.provider_parse")
+
 local SLUG = "deepseek"
 local BALANCE_PATH = "/user/balance"
 -- `opts.thinking` arrives rendered, and this is the one rendering that means
@@ -12,7 +14,6 @@ local BALANCE_PATH = "/user/balance"
 local THINKING_OFF = "off"
 -- The API only checks that the field exists.
 local PAD = ""
-local HTTP_OK = 200
 -- R1 is the one model outside the thinking protocol DeepSeek introduced with
 -- V4: it reasons unconditionally and refuses `reasoning_content` as input. The
 -- gate names that id rather than matching a version marker in the others,
@@ -77,14 +78,13 @@ maki.provider.register({
   -- returned rather than raised, so it fails the way the native provider does.
   fetch_usage = function()
     local auth = assert(maki.provider.auth.resolved(SLUG))
-    local res = assert(maki.net.request(auth.base_url .. BALANCE_PATH, { headers = auth.headers }))
-    if res.status ~= HTTP_OK then
-      return nil, maki.provider.http_error(res)
+    local parsed, err = parse.get_json(auth, auth.base_url .. BALANCE_PATH)
+    if err then
+      return parse.fail(err)
     end
-    local parsed = assert(maki.json.decode(res.body))
 
     local limits = {}
-    for _, info in ipairs(parsed.balance_infos or {}) do
+    for _, info in parse.items(parsed.balance_infos) do
       table.insert(limits, balance_limit(info))
     end
     return { limits = limits }

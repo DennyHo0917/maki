@@ -37,6 +37,12 @@ const HOOK_TIMEOUT: Duration = Duration::from_secs(30);
 /// The budget for hooks that sit between the user and their first token.
 /// Anything slower here is felt as latency on every single request.
 const REQUEST_HOOK_TIMEOUT: Duration = Duration::from_secs(5);
+/// The backstop for hooks that fetch from the provider's own origin
+/// (`list_models`, `fetch_usage`). Their requests already stop on a dead
+/// server through connect and stall bounds, so this only has to catch a
+/// runaway plugin, not a slow link: a catalogue that is still arriving, or a
+/// fallback after a stalled call, must get to finish.
+const SIDE_CALL_HOOK_TIMEOUT: Duration = Duration::from_secs(300);
 
 const RESOLVE_AUTH: &str = "resolve_auth";
 const REFRESH_AUTH: &str = "refresh_auth";
@@ -638,10 +644,19 @@ fn owned(slugs: &OwnedSlugs, slug: &str) -> LuaResult<()> {
 ///   `list_models` (function) `function()` returning a list of model rows,
 ///            for a provider whose catalogue is only known at runtime. Rows
 ///            carry `id`, `context_window`, `max_output_tokens`, `pricing`,
-///            `supports_thinking`, `supports_vision` and `tier`.
+///            `supports_thinking`, `supports_vision` and `tier`. Two more
+///            are optional. `extra` is any JSON value the plugin wants back
+///            when the model is used. `effort` narrows the declared
+///            `openai.thinking` dialect for this model: `supported` lists
+///            its effort names as the provider spells them (names maki has
+///            no level for are dropped, an empty list keeps the dialect's
+///            levels), and `send_off` is `true` to send `"none"` for off,
+///            `false` to send nothing, or omitted to keep the dialect's way.
 ///   `build_body` (function) `function(body, model, opts)` returning the
 ///            request body to send. `opts.thinking` is the effort level as
-///            rendered. Only for the `openai` codecs.
+///            rendered. `opts.model_info` is the `extra` this provider's
+///            `list_models` attached to the model, nil when it attached none
+///            or the model was never listed. Only for the `openai` codecs.
 ///   `map_error` (function) `function(status, message)` returning
 ///            `{ status = ..., message = ... }`, or nil to keep the original.
 ///            Those two fields are all it may change: `retry_after` comes from
@@ -708,10 +723,10 @@ fn register(
             decl,
             hooks: ProviderHooks {
                 auth: hook(&keys, HookSlot::Auth, Some(HOOK_TIMEOUT)),
-                list_models: hook(&keys, HookSlot::ListModels, Some(HOOK_TIMEOUT)),
+                list_models: hook(&keys, HookSlot::ListModels, Some(SIDE_CALL_HOOK_TIMEOUT)),
                 build_body: hook(&keys, HookSlot::BuildBody, Some(REQUEST_HOOK_TIMEOUT)),
                 map_error: hook(&keys, HookSlot::MapError, Some(REQUEST_HOOK_TIMEOUT)),
-                fetch_usage: hook(&keys, HookSlot::FetchUsage, Some(HOOK_TIMEOUT)),
+                fetch_usage: hook(&keys, HookSlot::FetchUsage, Some(SIDE_CALL_HOOK_TIMEOUT)),
                 login: hook(&keys, HookSlot::Login, None),
                 logout: hook(&keys, HookSlot::Logout, None),
             },

@@ -7,6 +7,7 @@ use maki_providers::plugin;
 use mlua::{Error as LuaError, Function, IntoLuaMulti, Lua, Result as LuaResult};
 use semver::Version;
 use tracing::warn;
+use url::Url;
 
 use crate::error::PluginError;
 
@@ -84,6 +85,18 @@ impl NetEgress {
             return true;
         };
         host_allowed(host, declared) || self.serves(host)
+    }
+
+    /// Whether `url` is on the origin of a provider this plugin registered,
+    /// as chosen by the user or by maki. See [`plugin::vouched_origin`].
+    pub(crate) fn vouches(&self, url: &Url) -> bool {
+        let origin = url.origin();
+        self.providers
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .filter_map(|slug| plugin::vouched_origin(slug))
+            .any(|vouched| vouched.origin() == origin)
     }
 
     fn serves(&self, host: &str) -> bool {

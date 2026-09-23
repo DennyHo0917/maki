@@ -1,33 +1,41 @@
 use std::borrow::Cow;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
-use flume::Sender;
-use maki_storage::id::SessionRef;
-use serde_json::{Value, json};
+use futures_lite::future::zip;
+use isahc::http::{HeaderMap, HeaderName, HeaderValue};
+use serde_json::{Map, Value, json};
 use tracing::warn;
 
 use maki_config::providers::Protocol;
 
-use crate::model::{Model, ModelFamily, ModelInfo, ModelPricing};
-use crate::provider::{BoxFuture, Provider};
+use crate::model::{ModelFamily, ModelInfo, ModelPricing};
+use crate::provider::BoxFuture;
 use crate::providers::aperture::DEFAULT_PATH_PREFIX;
 use crate::spec::{
-    ApertureRoute, AuthDoc, CatalogDoc, GeneratedDocs, LoginConfig, NO_CURATED_MODELS, Native,
-    ProviderSpec,
+    ApertureRoute, AuthDoc, CatalogDoc, GeneratedDocs, LoginConfig, NO_CURATED_MODELS, ProviderSpec,
 };
-use crate::{AgentError, Message, ProviderEvent, RequestOptions, StreamResponse, dialect};
+use crate::{AgentError, dialect};
 
+use super::Timeouts;
 use super::openai_compat::{MODELS_PATH, OpenAiCompatConfig, OpenAiCompatProvider};
-use super::{KeyHeader, KeyPool, KeyRotation, ResolvedAuth, Timeouts};
+use super::plugin::{
+    self, EffortField, Hook, OpenAiWire, ProviderDecl, ProviderHooks, ThinkingWire,
+};
 
+const REFERER_HEADER: &str = "http-referer";
 const REFERER: &str = "https://maki.sh";
+const TITLE_HEADER: &str = "x-title";
 const APP_TITLE: &str = "maki";
+/// Requesty only inserts Anthropic cache breakpoints when asked to. Without
+/// this flag Claude pays full input price every turn.
+const CACHE_FIELD: &str = "requesty";
 const PER_MILLION: f64 = 1_000_000.0;
 /// Requesty's own curated routing policies, with short stable ids like
 /// `claude-sonnet-4-5` that spread across several upstream providers. Listed
 /// before the raw `<vendor>/<model>` catalog at [`MODELS_PATH`].
 const MANAGED_MODELS_PATH: &str = "/models/managed";
 const CHAT_API: &str = "chat";
+const NET_HOST: &str = "router.requesty.ai";
 
 const SLUG: &str = "requesty";
 const DISPLAY_NAME: &str = "Requesty";
@@ -67,10 +75,7 @@ pub(crate) const SPEC: ProviderSpec = ProviderSpec {
     fallback_context_window: 200_000,
     models_toml: NO_CURATED_MODELS,
     pricing_schedule: None,
-    native: Some(Native {
-        new: create,
-        with_auth: create_with_auth,
-    }),
+    native: None,
     aperture: Some(ApertureRoute {
         path_prefix: DEFAULT_PATH_PREFIX,
     }),
@@ -91,53 +96,92 @@ pub(crate) const SPEC: ProviderSpec = ProviderSpec {
     },
 };
 
-fn create(timeouts: Timeouts) -> Result<Box<dyn Provider>, AgentError> {
-    Ok(Box::new(Requesty::new(timeouts)?))
-}
-
-fn create_with_auth(
-    auth: Arc<Mutex<ResolvedAuth>>,
-    timeouts: Timeouts,
-    system_prefix: Option<String>,
-) -> Box<dyn Provider> {
-    Box::new(Requesty::with_auth(auth, timeouts).with_system_prefix(system_prefix))
-}
-
 inventory::submit!(SPEC.config_row());
 
-pub struct Requesty {
-    compat: OpenAiCompatProvider,
-    auth: Arc<Mutex<ResolvedAuth>>,
-    key_pool: Option<KeyPool>,
-    system_prefix: Option<String>,
+/// Requesty as a declaration, plus the listing the openai codec cannot spell,
+/// see [`hooks`].
+///
+/// Everything static about its wire is data here: the attribution headers, the
+/// cache flag in every body, and effort in the `prefer-high` dialect sent only
+/// to a model that reasons, since Requesty passes the field on to upstreams
+/// that reject it. Claiming a built-in slug inherits the whole [`SPEC`] row,
+/// and `max_tokens` and streamed usage are already the codec's defaults.
+///
+/// The bundled `requesty` Lua plugin says all of this again on the surface a
+/// third-party plugin uses, and outranks this at every real startup.
+pub(crate) fn decl() -> ProviderDecl {
+    ProviderDecl {
+        slug: SLUG.to_owned(),
+        display_name: None,
+        codec: Some(Protocol::Openai),
+        base: None,
+        base_url: Some(BASE_URL.to_owned()),
+        api_key_env: None,
+        system_prefix: None,
+        models: Vec::new(),
+        openai: Some(OpenAiWire {
+            thinking: Some(ThinkingWire {
+                dialect: &dialect::PREFER_HIGH,
+                field: EffortField::default(),
+                requires_support: true,
+            }),
+            headers: HeaderMap::from_iter([
+                (
+                    HeaderName::from_static(REFERER_HEADER),
+                    HeaderValue::from_static(REFERER),
+                ),
+                (
+                    HeaderName::from_static(TITLE_HEADER),
+                    HeaderValue::from_static(APP_TITLE),
+                ),
+            ]),
+            extra_body: Some(Map::from_iter([(
+                CACHE_FIELD.to_owned(),
+                json!({ "auto_cache": true }),
+            )])),
+            ..OpenAiWire::default()
+        }),
+        net_hosts: vec![NET_HOST.to_owned()],
+    }
 }
 
-impl Requesty {
-    pub fn new(timeouts: super::Timeouts) -> Result<Self, AgentError> {
-        let pool = KeyPool::resolve(&CONFIG.slug, &CONFIG.api_key_env)?;
-        Ok(Self {
-            compat: OpenAiCompatProvider::new(&CONFIG, timeouts),
-            auth: Arc::new(Mutex::new(ResolvedAuth::bearer(
-                &CONFIG.slug,
-                pool.current(),
-            )?)),
-            key_pool: Some(pool),
-            system_prefix: None,
+/// The one callback [`decl`] cannot spell, registered alongside it.
+pub(crate) fn hooks() -> ProviderHooks {
+    ProviderHooks {
+        list_models: Some(Arc::new(Catalog)),
+        ..ProviderHooks::default()
+    }
+}
+
+/// Managed policies first, then the full catalog, fetched at once: the picker
+/// only shows up once the slowest provider answers, so back to back round trips
+/// here cost everyone. Either listing stands in for the other when it fails,
+/// and with both down the managed failure is the one that surfaces.
+struct Catalog;
+
+impl Hook<(), Vec<ModelInfo>> for Catalog {
+    fn call(&self, (): ()) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
+        Box::pin(async move {
+            let auth = plugin::registered_auth(SLUG)?;
+            let compat = OpenAiCompatProvider::new(&CONFIG, Timeouts::default());
+            let (managed, catalog) = zip(
+                compat.fetch_and_parse_models(&auth, MANAGED_MODELS_PATH, parse_model),
+                compat.fetch_and_parse_models(&auth, MODELS_PATH, parse_model),
+            )
+            .await;
+            match (managed, catalog) {
+                (Ok(managed), Ok(catalog)) => Ok(merge_models(managed, catalog)),
+                (Ok(managed), Err(e)) => {
+                    warn!(error = %e, "requesty: full catalog unavailable, listing managed models only");
+                    Ok(managed)
+                }
+                (Err(e), Ok(catalog)) => {
+                    warn!(error = %e, "requesty: managed models unavailable, listing full catalog only");
+                    Ok(catalog)
+                }
+                (Err(e), Err(_)) => Err(e),
+            }
         })
-    }
-
-    pub(crate) fn with_auth(auth: Arc<Mutex<ResolvedAuth>>, timeouts: super::Timeouts) -> Self {
-        Self {
-            compat: OpenAiCompatProvider::new(&CONFIG, timeouts),
-            auth,
-            key_pool: None,
-            system_prefix: None,
-        }
-    }
-
-    pub(crate) fn with_system_prefix(mut self, prefix: Option<String>) -> Self {
-        self.system_prefix = prefix;
-        self
     }
 }
 
@@ -207,8 +251,7 @@ fn parse_model(m: &Value) -> Option<ModelInfo> {
         pricing,
         supports_thinking: Some(entry.flag("supports_reasoning")),
         supports_vision: Some(entry.flag("supports_vision")),
-        tier: None,
-        provider_info: None,
+        ..ModelInfo::default()
     })
 }
 
@@ -221,75 +264,6 @@ fn merge_models(managed: Vec<ModelInfo>, catalog: Vec<ModelInfo>) -> Vec<ModelIn
         }
     }
     merged
-}
-
-impl Provider for Requesty {
-    fn stream_message<'a>(
-        &'a self,
-        model: &'a Model,
-        messages: &'a [Message],
-        system: &'a str,
-        tools: &'a Value,
-        event_tx: &'a Sender<ProviderEvent>,
-        opts: RequestOptions,
-        _session_id: Option<&'a SessionRef>,
-    ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
-        Box::pin(async move {
-            let auth = self.auth.lock().unwrap().clone();
-            let mut buf = String::new();
-            let system = super::with_prefix(&self.system_prefix, system, &mut buf);
-            let mut body = self.compat.build_body(model, messages, system, tools);
-
-            // Requesty only inserts Anthropic cache breakpoints when asked to.
-            // Without this flag Claude pays full input price every turn.
-            body["requesty"] = json!({"auto_cache": true});
-
-            if model.supports_thinking() {
-                opts.thinking
-                    .apply_reasoning_effort(&mut body, &dialect::PREFER_HIGH, model);
-            }
-
-            let extra_headers = [("HTTP-Referer", REFERER), ("X-Title", APP_TITLE)];
-            self.compat
-                .do_stream(model, &extra_headers, &body, event_tx, &auth)
-                .await
-        })
-    }
-
-    fn list_models(&self) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
-        Box::pin(async move {
-            let auth = self.auth.lock().unwrap().clone();
-            // Both listings at once: the picker only shows up once the slowest
-            // provider answers, so back to back round trips here cost everyone.
-            let (managed, catalog) = futures_lite::future::zip(
-                self.compat
-                    .fetch_and_parse_models(&auth, MANAGED_MODELS_PATH, parse_model),
-                self.compat
-                    .fetch_and_parse_models(&auth, MODELS_PATH, parse_model),
-            )
-            .await;
-            match (managed, catalog) {
-                (Ok(managed), Ok(catalog)) => Ok(merge_models(managed, catalog)),
-                (Ok(managed), Err(e)) => {
-                    warn!(error = %e, "requesty: full catalog unavailable, listing managed models only");
-                    Ok(managed)
-                }
-                (Err(e), Ok(catalog)) => {
-                    warn!(error = %e, "requesty: managed models unavailable, listing full catalog only");
-                    Ok(catalog)
-                }
-                (Err(e), Err(_)) => Err(e),
-            }
-        })
-    }
-
-    fn keys(&self) -> Option<KeyRotation<'_>> {
-        Some(KeyRotation::new(
-            self.key_pool.as_ref()?,
-            &self.auth,
-            KeyHeader::Bearer,
-        ))
-    }
 }
 
 #[cfg(test)]
@@ -438,8 +412,9 @@ mod tests {
     }
 }
 
-/// The recorded cases, kept out of the test module so every authoring replays
-/// the same list. Recorded against the bespoke `Requesty` impl above.
+/// The recorded cases, kept out of the test module so both authorings replay
+/// the same list: [`decl`] plus [`hooks`], and the bundled `requesty` Lua
+/// plugin.
 ///
 /// The two catalog fetches run concurrently, so every script that answers
 /// them is routed by path: arrival order is a race, and a sequential script
@@ -604,7 +579,8 @@ data: [DONE]
     }
 }
 
-/// The bespoke impl, recorded one exchange at a time.
+/// Requesty as [`decl`] plus [`hooks`] put it on the wire, one recorded
+/// exchange at a time.
 #[cfg(test)]
 mod replay_tests {
     use test_case::test_case;
@@ -628,20 +604,25 @@ mod replay_tests {
     #[test_case(&replay::MALFORMED_SSE, thinking_model() ; "malformed_sse")]
     #[test_case(&replay::EMPTY_SSE_ERROR, thinking_model() ; "empty_sse_error_frame")]
     #[test_case(&replay::TRUNCATED_STREAM, thinking_model() ; "truncated_stream")]
-    fn the_bespoke_impl_replays_the_recorded_exchange(fixture: &Fixture, model: Model) {
-        replay::bespoke(SLUG).stream(fixture, &model);
+    fn the_declaration_replays_the_recorded_exchange(fixture: &Fixture, model: Model) {
+        replay::declared(replay::rust_authoring, SLUG, fixture, &model);
     }
 
     #[test_case(&MODELS ; "models")]
     #[test_case(&MODELS_MANAGED_DOWN ; "models_managed_down")]
     #[test_case(&MODELS_CATALOG_DOWN ; "models_catalog_down")]
     #[test_case(&MODELS_BOTH_DOWN ; "models_both_down")]
-    fn the_bespoke_impl_lists_the_recorded_catalogs(fixture: &Fixture) {
-        replay::bespoke(SLUG).models(fixture);
+    fn the_declaration_lists_the_recorded_catalogs(fixture: &Fixture) {
+        replay::declared_models(replay::rust_authoring, SLUG, fixture);
     }
 
     #[test]
-    fn the_bespoke_impl_gates_the_effort_on_discovery() {
-        replay::bespoke(SLUG).discovered(&DISCOVERED_NON_THINKING, &model(NON_THINKING_SPEC));
+    fn the_declaration_gates_the_effort_on_discovery() {
+        replay::declared_discovered(
+            replay::rust_authoring,
+            SLUG,
+            &DISCOVERED_NON_THINKING,
+            &model(NON_THINKING_SPEC),
+        );
     }
 }

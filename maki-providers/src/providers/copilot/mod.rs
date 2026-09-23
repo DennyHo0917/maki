@@ -432,6 +432,8 @@ impl CopilotModel {
                 .model_picker_category
                 .and_then(CopilotModelCategory::tier),
             provider_info: Some(Arc::new(reasoning)),
+            extra: None,
+            effort: None,
         }
     }
 

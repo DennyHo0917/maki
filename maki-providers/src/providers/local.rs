@@ -311,6 +311,8 @@ impl LocalEndpoint {
                     supports_vision,
                     tier: None,
                     provider_info: None,
+                    extra: None,
+                    effort: None,
                 })
             })
             .collect();
@@ -439,6 +441,8 @@ impl LocalEndpoint {
                 supports_vision: d.supports_vision,
                 tier: None,
                 provider_info: None,
+                extra: None,
+                effort: None,
             })
             .collect();
         models.sort_by(|a, b| a.id.cmp(&b.id));

@@ -26,7 +26,10 @@ use crate::{AgentError, Message, ProviderEvent, ProviderUsage, RequestOptions, S
 
 use super::codec::{self, BodyHook, CodecOptions, RequestCtx};
 pub use super::codec::{EffortField, OpenAiWire, SessionCarrier, ThinkingWire};
-use super::{KeyHeader, KeyPool, KeyRotation, ResolvedAuth, Timeouts, deepseek, synthetic};
+use super::{
+    KeyHeader, KeyPool, KeyRotation, ResolvedAuth, Timeouts, deepseek, mistral, openrouter, regolo,
+    requesty, synthetic, tensorx,
+};
 
 const DEFAULT_MAX_OUTPUT_TOKENS: u32 = 16384;
 const DEFAULT_CONTEXT_WINDOW: u32 = 128_000;
@@ -68,14 +71,18 @@ pub enum AuthPurpose {
     Reload,
 }
 
-/// The request as it goes on the wire, plus the two things a plugin branches
-/// on. `thinking` is rendered text and not structure, because the hook is a
+/// The request as it goes on the wire, plus the things a plugin branches on.
+/// `thinking` is rendered text and not structure, because the hook is a
 /// wire-level escape hatch and not a second place to model effort.
 #[derive(Serialize)]
 pub struct BodyInput {
     pub body: Value,
     pub model: String,
     pub thinking: String,
+    /// The [`ModelInfo::extra`] this slug's `list_models` attached to the
+    /// model, absent when discovery said nothing about it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model_info: Option<Value>,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -221,6 +228,8 @@ impl PluginModel {
             supports_vision: self.supports_vision,
             tier: Some(self.tier),
             provider_info: None,
+            extra: None,
+            effort: None,
         }
     }
 }
@@ -484,6 +493,26 @@ const RUST_DECLS: &[fn() -> Registration] = &[
         decl: deepseek::decl(),
         hooks: deepseek::hooks(),
     },
+    || Registration {
+        decl: mistral::decl(),
+        hooks: mistral::hooks(),
+    },
+    || Registration {
+        decl: tensorx::decl(),
+        hooks: tensorx::hooks(),
+    },
+    || Registration {
+        decl: regolo::decl(),
+        hooks: regolo::hooks(),
+    },
+    || Registration {
+        decl: requesty::decl(),
+        hooks: requesty::hooks(),
+    },
+    || Registration {
+        decl: openrouter::decl(),
+        hooks: openrouter::hooks(),
+    },
 ];
 
 /// Opens the registration window, at the top of every plugin load.
@@ -705,17 +734,21 @@ fn register_decl(
         .map_err(RegisterError::UndeclaredBaseUrl)?;
     let target = target_of(&decl, &hooks)?;
     // Checked now and applied at [`commit_load`], so a bad `[<slug>.headers]`
-    // still fails the plugin that registered the slug.
-    ResolvedAuth::new(&slug, Vec::new()).map_err(|e| RegisterError::Credentials {
-        slug: slug.clone(),
-        message: e.to_string(),
-    })?;
+    // still fails the plugin that registered the slug. A built-in's fails only
+    // its own [`create`], as it did natively: failing the bundled load would
+    // keep maki from starting over a provider the user may never pick.
+    if claimed.is_none() {
+        ResolvedAuth::new(&slug, Vec::new()).map_err(|e| RegisterError::Credentials {
+            slug: slug.clone(),
+            message: e.to_string(),
+        })?;
+    }
 
     let mut staging = STAGING.lock().unwrap();
     let Some(staged) = staging.as_mut() else {
         return Err(RegisterError::Closed(slug));
     };
-    let auth = shared_auth(&slug)?;
+    let auth = shared_auth(&slug);
     debug!(
         slug,
         ?source,
@@ -779,14 +812,14 @@ fn target_of(decl: &ProviderDecl, hooks: &ProviderHooks) -> Result<Target, Regis
 /// One cell of credentials per slug, for the life of the process. Reusing it
 /// is what carries a token across a reload, and what stops a reload from
 /// minting a second [`RefreshGate`] for a slug whose token is in flight.
-fn shared_auth(slug: &str) -> Result<Arc<AuthState>, RegisterError> {
+fn shared_auth(slug: &str) -> Arc<AuthState> {
     let mut states = AUTH.write().unwrap();
     if let Some(state) = states.get(slug) {
-        return Ok(Arc::clone(state));
+        return Arc::clone(state);
     }
-    let state = Arc::new(AuthState::new(slug)?);
+    let state = Arc::new(AuthState::new());
     states.insert(slug.into(), Arc::clone(&state));
-    Ok(state)
+    state
 }
 
 /// Whether a `providers.toml` entry defines a provider of its own, as opposed
@@ -968,14 +1001,15 @@ struct AuthState {
 impl AuthState {
     /// Starts with no credentials and no declared hosts. [`Self::redeclare`]
     /// runs before anything can read this, so starting empty fails closed if
-    /// it ever did not.
-    fn new(slug: &str) -> Result<Self, RegisterError> {
-        Ok(Self {
-            current: Arc::new(Mutex::new(DeclaredKeys::Hooked.initial_auth(slug)?)),
+    /// it ever did not, or if the declaration's `[<slug>.headers]` did not
+    /// resolve (which [`create`] then reports).
+    fn new() -> Self {
+        Self {
+            current: Arc::new(Mutex::new(ResolvedAuth::withheld())),
             hosts: Mutex::default(),
             keys: Mutex::new(DeclaredKeys::Hooked),
             gate: RefreshGate::default(),
-        })
+        }
     }
 
     fn hosts(&self) -> Arc<[String]> {
@@ -1205,6 +1239,7 @@ impl BodyHook for BodyAdapter {
             body,
             model: ctx.model.id.clone(),
             thinking: ctx.opts.thinking.to_string(),
+            model_info: ctx.discovered.as_ref().and_then(|info| info.extra.clone()),
         })
     }
 }
@@ -1413,6 +1448,9 @@ impl Provider for PluginProvider {
 /// rule keys off the declared field, never off who wrote the declaration.
 pub fn create(slug: &str, timeouts: Timeouts) -> Result<Box<dyn Provider>, AgentError> {
     let entry = entry(slug).ok_or_else(|| unknown(slug))?;
+    // Re-resolved per build, as a native constructor did, so a bad
+    // `[<slug>.headers]` a built-in's registration let through fails here.
+    ResolvedAuth::new(slug, Vec::new())?;
     let pool = entry.auth.declared_pool(slug)?;
     // The same handle the codec reads per request, so credentials resolved by a
     // later `ensure_auth` land without rebuilding anything.
@@ -1473,6 +1511,15 @@ pub fn resolved_auth(slug: &str) -> Option<ResolvedAuth> {
     Some(entry(slug)?.auth.current.lock().unwrap().clone())
 }
 
+/// [`resolved_auth`] for a built-in's Rust hook. Hooks are handed no
+/// credentials, so one that fetches off the codec's request path reads the
+/// ones its registration resolved.
+pub(crate) fn registered_auth(slug: &str) -> Result<ResolvedAuth, AgentError> {
+    resolved_auth(slug).ok_or_else(|| AgentError::Config {
+        message: format!("{slug} is not registered"),
+    })
+}
+
 /// The origin a request to `slug` would reach right now, resolved the way a
 /// codec resolves it per request: an auth-supplied origin, then the user's
 /// `<SLUG>_BASE_URL` or `providers.toml`, then the declared default.
@@ -1481,12 +1528,40 @@ pub fn resolved_auth(slug: &str) -> Option<ResolvedAuth> {
 /// same origin the codec would, or a user who points the slug at a gateway has
 /// that one call go somewhere else.
 pub fn effective_base_url(slug: &str) -> Option<String> {
+    resolve_base_url(entry(slug)?.as_ref()).map(|(base_url, _)| base_url)
+}
+
+/// The origin of [`effective_base_url`] when the user or maki picked it, never
+/// one a third-party plugin authored.
+///
+/// The codec reaches this origin over the Rust client, which knows no
+/// private-address guard, so a provider's own side calls have to reach it on
+/// the same terms: a user pointing a slug at a LAN gateway, or sitting behind
+/// a fake-IP proxy, gets a listing and not only a chat.
+pub fn vouched_origin(slug: &str) -> Option<Url> {
     let entry = entry(slug)?;
-    if let Some(explicit) = entry.auth.current.lock().unwrap().base_url.clone() {
-        return Some(explicit);
+    let (base_url, chosen_by) = resolve_base_url(&entry)?;
+    if chosen_by == OriginChooser::Plugin && entry.claimed.is_none() {
+        return None;
     }
-    let providers = ProvidersConfig::load();
-    configured_base_url(slug, providers.get(slug)).or_else(|| entry.decl.base_url.clone())
+    Url::parse(&base_url).ok()
+}
+
+#[derive(PartialEq, Eq)]
+enum OriginChooser {
+    User,
+    Plugin,
+}
+
+fn resolve_base_url(entry: &PluginEntry) -> Option<(String, OriginChooser)> {
+    if let Some(explicit) = entry.auth.current.lock().unwrap().base_url.clone() {
+        return Some((explicit, OriginChooser::Plugin));
+    }
+    let slug = entry.decl.slug.as_str();
+    if let Some(configured) = configured_base_url(slug, ProvidersConfig::load().get(slug)) {
+        return Some((configured, OriginChooser::User));
+    }
+    Some((entry.decl.base_url.clone()?, OriginChooser::Plugin))
 }
 
 /// The host of [`effective_base_url`], for a caller deciding whether an
@@ -1634,6 +1709,7 @@ mod tests {
     use std::time::Duration;
 
     use futures_lite::future::zip;
+    use maki_config::providers::base_url_env_var;
     use test_case::test_case;
 
     use super::*;
@@ -1850,7 +1926,7 @@ mod tests {
     fn entry_with(hooks: ProviderHooks) -> Arc<PluginEntry> {
         const SLUG: &str = "in-memory";
         let decl = decl(SLUG);
-        let auth = AuthState::new(SLUG).unwrap();
+        let auth = AuthState::new();
         auth.redeclare(SLUG, None, &decl.net_hosts).unwrap();
         Arc::new(PluginEntry {
             decl,
@@ -2188,6 +2264,30 @@ mod tests {
             "{STILL_AUTHORIZED}"
         );
         assert_eq!(requests.lock().unwrap().len(), 1, "{REJECTED_TWICE}");
+    }
+
+    /// Only an origin the user or maki chose skips the side-call guard, never
+    /// the one a third-party decl wrote.
+    #[test_case(DeclAuthority::ThirdParty, None, None ; "third_party_declared_origin")]
+    #[test_case(DeclAuthority::ThirdParty, Some(OTHER_BASE_URL), Some(OTHER_BASE_URL) ; "third_party_user_origin")]
+    #[test_case(DeclAuthority::Bundled, None, Some(EXAMPLE_BASE_URL) ; "bundled_declared_origin")]
+    fn vouched_origin_is_the_users_or_makis(
+        authority: DeclAuthority,
+        configured: Option<&str>,
+        expected: Option<&str>,
+    ) {
+        const THIRD_PARTY_SLUG: &str = "vouch-plugin";
+        let (slug, reg) = match authority {
+            DeclAuthority::Bundled => (CLAIMED_SLUG, claim(CLAIMED_SLUG)),
+            DeclAuthority::ThirdParty => (THIRD_PARTY_SLUG, registration(THIRD_PARTY_SLUG)),
+        };
+        if let Some(configured) = configured {
+            unsafe { std::env::set_var(base_url_env_var(slug), configured) };
+        }
+        register_loaded_as(reg, authority).unwrap();
+
+        let expected = expected.map(|url| Url::parse(url).unwrap());
+        assert_eq!(vouched_origin(slug), expected);
     }
 
     /// A decl that claims a built-in slug states only what the row does not

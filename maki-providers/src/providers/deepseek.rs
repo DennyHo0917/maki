@@ -137,6 +137,7 @@ impl Hook<BodyInput, Value> for ThinkingToggle {
                 mut body,
                 model,
                 thinking,
+                model_info: _,
             } = input;
             let enabled = thinking != THINKING_OFF;
             let mode = if enabled {

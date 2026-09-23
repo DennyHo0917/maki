@@ -10,10 +10,11 @@ use std::borrow::Cow;
 use std::fmt;
 use std::sync::{Arc, OnceLock};
 
+use jiff::Timestamp;
 use maki_storage::intern;
 pub use maki_storage::sessions::Effort;
 use maki_storage::sessions::{MIN_THINKING_BUDGET, StoredThinking, TitleSource};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{Map, Value, json};
 use strum::{Display, IntoStaticStr};
 use tracing::warn;
@@ -1118,12 +1119,45 @@ pub struct UsageLimit {
     /// Usage percentage within the window, 0-100.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub percentage: Option<u32>,
-    /// When the window resets, as epoch milliseconds.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// When the window resets, as epoch milliseconds. Also read from an RFC
+    /// 3339 timestamp, see [`deserialize_reset_at`].
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_reset_at"
+    )]
     pub reset_at: Option<u64>,
     /// Extra provider-supplied context, e.g. "$2.33 spent" for usage credits.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>,
+}
+
+/// Epoch milliseconds of an RFC 3339 timestamp, clamped at the epoch. `None`
+/// for a string that is no timestamp.
+pub(crate) fn rfc3339_millis(at: &str) -> Option<u64> {
+    at.parse::<Timestamp>()
+        .ok()
+        .map(|at| at.as_millisecond().max(0) as u64)
+}
+
+/// A usage hook may hand back the timestamp it read off the wire as is, so a
+/// plugin needs no date parser that could drift from this one. A string that
+/// is no timestamp reads as no reset, the way maki's own providers read one,
+/// rather than failing the whole report over one field.
+fn deserialize_reset_at<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<u64>, D::Error> {
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum ResetAt {
+        Millis(u64),
+        Timestamp(String),
+    }
+    Ok(match Option::<ResetAt>::deserialize(deserializer)? {
+        Some(ResetAt::Millis(millis)) => Some(millis),
+        Some(ResetAt::Timestamp(at)) => rfc3339_millis(&at),
+        None => None,
+    })
 }
 
 #[cfg(test)]
@@ -1858,5 +1892,25 @@ mod tests {
         };
         let json = serde_json::to_value(&block).unwrap();
         assert!(json.get("signature").is_none());
+    }
+
+    const USAGE_LABEL: &str = "Spend";
+    const RESET_MILLIS: u64 = 1_790_812_800_250;
+
+    #[test_case(json!(RESET_MILLIS), Some(RESET_MILLIS) ; "epoch_millis")]
+    #[test_case(json!("2026-10-01T02:00:00.25+02:00"), Some(RESET_MILLIS) ; "rfc3339_with_offset_and_fraction")]
+    #[test_case(json!("1969-12-31T23:59:59Z"), Some(0) ; "before_the_epoch_clamps")]
+    #[test_case(json!("next month"), None ; "not_a_timestamp")]
+    #[test_case(Value::Null, None ; "null")]
+    fn usage_limit_reset_at_reads_millis_or_rfc3339(reset_at: Value, expected: Option<u64>) {
+        let limit: UsageLimit =
+            serde_json::from_value(json!({ "label": USAGE_LABEL, "reset_at": reset_at })).unwrap();
+        assert_eq!(limit.reset_at, expected);
+    }
+
+    #[test]
+    fn usage_limit_without_reset_at_has_none() {
+        let limit: UsageLimit = serde_json::from_value(json!({ "label": USAGE_LABEL })).unwrap();
+        assert_eq!(limit.reset_at, None);
     }
 }

@@ -1,30 +1,40 @@
 use std::borrow::Cow;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
-use flume::Sender;
-use maki_storage::id::SessionRef;
-use serde_json::{Value, json};
+use isahc::http::{HeaderMap, HeaderName, HeaderValue};
+use serde_json::{Map, Value, json};
 
 use maki_config::providers::Protocol;
 
-use crate::model::{Model, ModelFamily, ModelInfo, ModelPricing};
-use crate::provider::{BoxFuture, Provider};
+use crate::model::{ModelEffort, ModelFamily, ModelInfo, ModelPricing};
+use crate::provider::BoxFuture;
 use crate::providers::aperture::DEFAULT_PATH_PREFIX;
 use crate::spec::{
-    ApertureRoute, AuthDoc, CatalogDoc, GeneratedDocs, LoginConfig, NO_CURATED_MODELS, Native,
-    ProviderSpec,
+    ApertureRoute, AuthDoc, CatalogDoc, GeneratedDocs, LoginConfig, NO_CURATED_MODELS, ProviderSpec,
 };
-use crate::{
-    AgentError, Effort, EffortDialect, Message, ProviderEvent, RequestOptions, StreamResponse,
-    dialect,
-};
+use crate::{AgentError, dialect};
 
+use super::Timeouts;
 use super::openai_compat::{MODELS_PATH, OpenAiCompatConfig, OpenAiCompatProvider};
-use super::{KeyHeader, KeyPool, KeyRotation, ResolvedAuth, Timeouts};
+use super::plugin::{
+    self, EffortField, Hook, OpenAiWire, ProviderDecl, ProviderHooks, SessionCarrier, ThinkingWire,
+};
 
+const REFERER_HEADER: &str = "http-referer";
 const REFERER: &str = "https://maki.sh";
+const TITLE_HEADER: &str = "x-openrouter-title";
 const APP_TITLE: &str = "maki";
+const EFFORT_FIELD: &str = "reasoning.effort";
+const INVALID_EFFORT_FIELD: &str = "openrouter's effort field is a valid dotted path";
+/// Marks the whole prompt as cacheable, for the upstreams that only cache
+/// when asked to.
+const CACHE_FIELD: &str = "cache_control";
+const SESSION_FIELD: &str = "session_id";
 const PER_MILLION: f64 = 1_000_000.0;
+const TEXT_MODALITY: &str = "text";
+const IMAGE_MODALITY: &str = "image";
+const REASONING_PARAMETER: &str = "reasoning";
+const NET_HOST: &str = "openrouter.ai";
 
 const SLUG: &str = "openrouter";
 const DISPLAY_NAME: &str = "OpenRouter";
@@ -59,10 +69,7 @@ pub(crate) const SPEC: ProviderSpec = ProviderSpec {
     fallback_context_window: 200_000,
     models_toml: NO_CURATED_MODELS,
     pricing_schedule: None,
-    native: Some(Native {
-        new: create,
-        with_auth: create_with_auth,
-    }),
+    native: None,
     aperture: Some(ApertureRoute {
         path_prefix: DEFAULT_PATH_PREFIX,
     }),
@@ -83,99 +90,100 @@ pub(crate) const SPEC: ProviderSpec = ProviderSpec {
     },
 };
 
-fn create(timeouts: Timeouts) -> Result<Box<dyn Provider>, AgentError> {
-    Ok(Box::new(OpenRouter::new(timeouts)?))
-}
-
-fn create_with_auth(
-    auth: Arc<Mutex<ResolvedAuth>>,
-    timeouts: Timeouts,
-    system_prefix: Option<String>,
-) -> Box<dyn Provider> {
-    Box::new(OpenRouter::with_auth(auth, timeouts).with_system_prefix(system_prefix))
-}
-
 inventory::submit!(SPEC.config_row());
 
-#[derive(Debug)]
-struct OpenRouterModelInfo {
-    reasoning_mandatory: bool,
-    reasoning_default_enabled: bool,
-    reasoning_efforts: Vec<Effort>,
+/// OpenRouter as a declaration, plus the listing the openai codec cannot
+/// spell, see [`hooks`].
+///
+/// Everything static about its wire is data here: the attribution headers,
+/// the cache marker in every body, the session id in the body, and effort
+/// under `reasoning.effort` in the `prefer-high` dialect, sent only to a model
+/// that reasons. That dialect is only the fallback for a model the listing
+/// never described: a listed one narrows it through [`ModelInfo::effort`].
+/// Claiming a built-in slug inherits the whole [`SPEC`] row, and `max_tokens`
+/// and streamed usage are already the codec's defaults.
+///
+/// The bundled `openrouter` Lua plugin says all of this again on the surface
+/// a third-party plugin uses, and outranks this at every real startup.
+pub(crate) fn decl() -> ProviderDecl {
+    ProviderDecl {
+        slug: SLUG.to_owned(),
+        display_name: None,
+        codec: Some(Protocol::Openai),
+        base: None,
+        base_url: Some(BASE_URL.to_owned()),
+        api_key_env: None,
+        system_prefix: None,
+        models: Vec::new(),
+        openai: Some(OpenAiWire {
+            thinking: Some(ThinkingWire {
+                dialect: &dialect::PREFER_HIGH,
+                field: EffortField::parse(EFFORT_FIELD).expect(INVALID_EFFORT_FIELD),
+                requires_support: true,
+            }),
+            headers: HeaderMap::from_iter([
+                (
+                    HeaderName::from_static(REFERER_HEADER),
+                    HeaderValue::from_static(REFERER),
+                ),
+                (
+                    HeaderName::from_static(TITLE_HEADER),
+                    HeaderValue::from_static(APP_TITLE),
+                ),
+            ]),
+            extra_body: Some(Map::from_iter([(
+                CACHE_FIELD.to_owned(),
+                json!({ "type": "ephemeral" }),
+            )])),
+            session_id: Some(SessionCarrier::BodyField(SESSION_FIELD.to_owned())),
+            ..OpenAiWire::default()
+        }),
+        net_hosts: vec![NET_HOST.to_owned()],
+    }
 }
 
-pub struct OpenRouter {
-    compat: OpenAiCompatProvider,
-    auth: Arc<Mutex<ResolvedAuth>>,
-    key_pool: Option<KeyPool>,
-    system_prefix: Option<String>,
+/// The one callback [`decl`] cannot spell, registered alongside it.
+pub(crate) fn hooks() -> ProviderHooks {
+    ProviderHooks {
+        list_models: Some(Arc::new(Catalog)),
+        ..ProviderHooks::default()
+    }
 }
 
-impl OpenRouter {
-    pub fn new(timeouts: super::Timeouts) -> Result<Self, AgentError> {
-        let pool = KeyPool::resolve(&CONFIG.slug, &CONFIG.api_key_env)?;
-        Ok(Self {
-            compat: OpenAiCompatProvider::new(&CONFIG, timeouts),
-            auth: Arc::new(Mutex::new(ResolvedAuth::bearer(
-                &CONFIG.slug,
-                pool.current(),
-            )?)),
-            key_pool: Some(pool),
-            system_prefix: None,
+/// `/models`, read with OpenRouter's own field names.
+struct Catalog;
+
+impl Hook<(), Vec<ModelInfo>> for Catalog {
+    fn call(&self, (): ()) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
+        Box::pin(async move {
+            let auth = plugin::registered_auth(SLUG)?;
+            OpenAiCompatProvider::new(&CONFIG, Timeouts::default())
+                .fetch_and_parse_models(&auth, MODELS_PATH, parse_model)
+                .await
         })
     }
-
-    pub(crate) fn with_auth(auth: Arc<Mutex<ResolvedAuth>>, timeouts: super::Timeouts) -> Self {
-        Self {
-            compat: OpenAiCompatProvider::new(&CONFIG, timeouts),
-            auth,
-            key_pool: None,
-            system_prefix: None,
-        }
-    }
-
-    pub(crate) fn with_system_prefix(mut self, prefix: Option<String>) -> Self {
-        self.system_prefix = prefix;
-        self
-    }
 }
 
-/// OpenRouter models come in three reasoning states, encoded here as a
-/// dialect so `effort_str` can resolve them like any other provider:
-/// 1. mandatory - always on; Off sends nothing (can't disable).
-/// 2. default_enabled - on by default; Off sends effort "none".
-/// 3. default off - Off sends nothing; any effort string turns it on.
-fn effort_dialect(info: Option<&OpenRouterModelInfo>) -> EffortDialect<'_> {
-    let Some(info) = info else {
-        return dialect::PREFER_HIGH;
-    };
-    EffortDialect {
-        supported: match info.reasoning_efforts.as_slice() {
-            [] => dialect::PREFER_HIGH.supported,
-            declared => declared,
-        },
-        off: (info.reasoning_default_enabled && !info.reasoning_mandatory).then_some(dialect::OFF),
-        ..dialect::PREFER_HIGH
-    }
+fn lists(modalities: &[Value], wanted: &str) -> bool {
+    modalities.iter().any(|m| m.as_str() == Some(wanted))
 }
 
+/// Only text-in, text-out models are listed. Prices arrive per token as
+/// strings and are scaled to $/M. One we cannot read leaves the pricing
+/// unknown rather than free.
+///
+/// A `reasoning` block comes in three states, which become the model's
+/// [`ModelEffort`]: mandatory (always on, Off sends nothing), default enabled
+/// (Off sends `none`) and default off (Off sends nothing, any effort turns it
+/// on). Its effort names go through as listed, for [`ModelEffort`] to vet.
 fn parse_model(m: &Value) -> Option<ModelInfo> {
-    // Filter: only text input/output models
     let architecture = m["architecture"].as_object()?;
     let input_modalities = architecture.get("input_modalities")?.as_array()?;
     let output_modalities = architecture.get("output_modalities")?.as_array()?;
-
-    let has_text_input = input_modalities.iter().any(|m| m.as_str() == Some("text"));
-    let has_text_output = output_modalities.iter().any(|m| m.as_str() == Some("text"));
-    if !has_text_input || !has_text_output {
+    if !lists(input_modalities, TEXT_MODALITY) || !lists(output_modalities, TEXT_MODALITY) {
         return None;
     }
 
-    let supports_vision = input_modalities.iter().any(|m| m.as_str() == Some("image"));
-
-    // Parse with OpenRouter-specific pricing field names. OpenRouter reports
-    // per-token prices; scale to $/M as `ModelPricing` expects. A missing or
-    // unparsable price stays `None` so it never reads as free.
     let id = m["id"].as_str()?;
     let context_window = m["context_length"]
         .as_u64()
@@ -193,102 +201,31 @@ fn parse_model(m: &Value) -> Option<ModelInfo> {
         ))
     });
 
-    let reasoning = m
-        .get("reasoning")
-        .and_then(|v| v.as_object())
-        .map(|v| OpenRouterModelInfo {
-            reasoning_mandatory: v.get("mandatory").and_then(Value::as_bool) == Some(true),
-            reasoning_default_enabled: v.get("default_enabled").and_then(Value::as_bool)
-                == Some(true),
-            reasoning_efforts: v
+    let effort = m["reasoning"].as_object().map(|reasoning| {
+        let flag = |name: &str| reasoning.get(name).and_then(Value::as_bool) == Some(true);
+        ModelEffort {
+            supported: reasoning
                 .get("supported_efforts")
                 .and_then(Value::as_array)
-                .map(|arr| {
-                    let mut efforts: Vec<Effort> = arr
-                        .iter()
-                        .filter_map(|v| v.as_str()?.parse().ok())
-                        .collect();
-                    efforts.sort_unstable();
-                    efforts
-                })
+                .map(|listed| ModelEffort::known_levels(listed))
                 .unwrap_or_default(),
-        });
-
-    let supports_thinking = reasoning.is_some()
-        || m.get("supported_parameters")
-            .and_then(|v| v.as_array())
-            .is_some_and(|v| v.iter().any(|v| v.as_str() == Some("reasoning")));
+            send_off: Some(flag("default_enabled") && !flag("mandatory")),
+        }
+    });
+    let supports_thinking = effort.is_some()
+        || m["supported_parameters"]
+            .as_array()
+            .is_some_and(|params| lists(params, REASONING_PARAMETER));
 
     Some(ModelInfo {
         id: id.to_string(),
         context_window,
-        max_output_tokens: None,
         pricing,
         supports_thinking: Some(supports_thinking),
-        supports_vision: Some(supports_vision),
-        tier: None,
-        provider_info: reasoning.map(|r| Arc::new(r) as Arc<dyn std::any::Any + Send + Sync>),
+        supports_vision: Some(lists(input_modalities, IMAGE_MODALITY)),
+        effort,
+        ..ModelInfo::default()
     })
-}
-
-impl Provider for OpenRouter {
-    fn stream_message<'a>(
-        &'a self,
-        model: &'a Model,
-        messages: &'a [Message],
-        system: &'a str,
-        tools: &'a Value,
-        event_tx: &'a Sender<ProviderEvent>,
-        opts: RequestOptions,
-        session_id: Option<&'a SessionRef>,
-    ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
-        Box::pin(async move {
-            let auth = self.auth.lock().unwrap().clone();
-            let mut buf = String::new();
-            let system = super::with_prefix(&self.system_prefix, system, &mut buf);
-            let mut body = self.compat.build_body(model, messages, system, tools);
-
-            body["cache_control"] = json!({"type": "ephemeral"});
-
-            let reasoning_info = crate::model_registry::provider_info::<OpenRouterModelInfo>(
-                &CONFIG.slug,
-                &model.id,
-            );
-
-            let effort_dialect = effort_dialect(reasoning_info.as_deref());
-            if model.supports_thinking()
-                && let Some(effort) = opts.thinking.effort_str(&effort_dialect, model)
-            {
-                body["reasoning"] = json!({"effort": effort});
-            }
-
-            if let Some(sid) = session_id {
-                body["session_id"] = json!(sid.to_string());
-            }
-
-            let extra_headers = [("HTTP-Referer", REFERER), ("X-OpenRouter-Title", APP_TITLE)];
-            self.compat
-                .do_stream(model, &extra_headers, &body, event_tx, &auth)
-                .await
-        })
-    }
-
-    fn list_models(&self) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
-        Box::pin(async move {
-            let auth = self.auth.lock().unwrap().clone();
-            self.compat
-                .fetch_and_parse_models(&auth, MODELS_PATH, parse_model)
-                .await
-        })
-    }
-
-    fn keys(&self) -> Option<KeyRotation<'_>> {
-        Some(KeyRotation::new(
-            self.key_pool.as_ref()?,
-            &self.auth,
-            KeyHeader::Bearer,
-        ))
-    }
 }
 
 #[cfg(test)]
@@ -296,13 +233,14 @@ mod tests {
     use test_case::test_case;
 
     use super::*;
-    use crate::ThinkingConfig;
+    use crate::Effort;
 
+    const KIMI_ID: &str = "moonshotai/kimi-k3";
     const UNKNOWN_PRICE_STAYS_UNKNOWN: &str = "a price we cannot read must not become a zero price";
 
     fn kimi_k3_json() -> Value {
         json!({
-            "id": "moonshotai/kimi-k3",
+            "id": KIMI_ID,
             "context_length": 1_048_576,
             "architecture": {
                 "input_modalities": ["text", "image"],
@@ -321,10 +259,11 @@ mod tests {
     fn parse_model_scales_pricing_to_per_million() {
         let info = parse_model(&kimi_k3_json()).expect("model should parse");
 
-        assert_eq!(info.id, "moonshotai/kimi-k3");
+        assert_eq!(info.id, KIMI_ID);
         assert_eq!(info.context_window, Some(1_048_576));
         assert_eq!(info.supports_vision, Some(true));
         assert_eq!(info.supports_thinking, Some(true));
+        assert_eq!(info.effort, None);
         let pricing = info.pricing.expect("pricing should be parsed");
         assert_eq!(pricing.input, 3.0);
         assert_eq!(pricing.output, 15.0);
@@ -357,92 +296,29 @@ mod tests {
         assert!(info.pricing.is_none(), "{UNKNOWN_PRICE_STAYS_UNKNOWN}");
     }
 
-    #[test]
-    fn parse_model_reasoning_efforts_skips_unknown_and_sorts() {
+    #[test_case(false, false, Some(false) ; "default_off_sends_nothing")]
+    #[test_case(true,  false, Some(true)  ; "default_enabled_disables_with_none")]
+    #[test_case(true,  true,  Some(false) ; "mandatory_cannot_be_disabled")]
+    fn parse_model_reads_the_reasoning_block_into_effort(
+        default_enabled: bool,
+        mandatory: bool,
+        send_off: Option<bool>,
+    ) {
         let mut m = kimi_k3_json();
         m["reasoning"] = json!({
-            "mandatory": false,
-            "default_enabled": true,
+            "mandatory": mandatory,
+            "default_enabled": default_enabled,
             "supported_efforts": ["high", "bogus", "low", "none"],
         });
 
         let info = parse_model(&m).expect("model should parse");
-        let provider_info = info.provider_info.expect("reasoning info should be set");
-        let reasoning = provider_info
-            .downcast_ref::<OpenRouterModelInfo>()
-            .expect("wrong provider info type");
-        assert!(reasoning.reasoning_default_enabled);
-        assert!(!reasoning.reasoning_mandatory);
-        assert_eq!(reasoning.reasoning_efforts, vec![Effort::Low, Effort::High]);
-    }
-
-    fn openrouter_model(info: Option<&OpenRouterModelInfo>) -> (EffortDialect<'_>, Model) {
-        let model = Model {
-            id: "test-model".into(),
-            provider: "openrouter".into(),
-            tier: crate::model::ModelTier::Medium,
-            family: crate::model::ModelFamily::Generic,
-            supports_tool_examples_override: None,
-            thinking_override: None,
-            supports_vision_override: None,
-            supports_fast_override: None,
-            pricing: ModelPricing::default(),
-            subsidised_by: None,
-            discovered_free: false,
-            max_output_tokens: Some(8192),
-            turn_output_tokens: None,
-            context_window: 200_000,
-            thinking_fields: None,
-        };
-        (effort_dialect(info), model)
-    }
-
-    fn reasoning_info(efforts: &[Effort]) -> OpenRouterModelInfo {
-        OpenRouterModelInfo {
-            reasoning_mandatory: false,
-            reasoning_default_enabled: false,
-            reasoning_efforts: efforts.to_vec(),
-        }
-    }
-
-    #[test_case(&[Effort::High, Effort::XHigh], ThinkingConfig::Effort(Effort::XHigh), "xhigh" ; "declared_xhigh_passes_through")]
-    #[test_case(&[Effort::High, Effort::XHigh], ThinkingConfig::Effort(Effort::Max),   "xhigh" ; "max_snaps_to_declared_xhigh")]
-    #[test_case(&[Effort::Minimal, Effort::Low], ThinkingConfig::Adaptive,             "low"   ; "adaptive_snaps_into_declared")]
-    #[test_case(&[], ThinkingConfig::Effort(Effort::XHigh), "high" ; "no_declared_falls_back_to_static")]
-    fn effort_dialect_snaps_once_against_declared_levels(
-        efforts: &[Effort],
-        config: ThinkingConfig,
-        expected: &str,
-    ) {
-        let info = reasoning_info(efforts);
-        let (dialect, model) = openrouter_model(Some(&info));
-        assert_eq!(config.effort_str(&dialect, &model), Some(expected));
-    }
-
-    #[test]
-    fn no_reasoning_info_still_requests_high_effort() {
-        let (dialect, model) = openrouter_model(None);
         assert_eq!(
-            ThinkingConfig::Adaptive.effort_str(&dialect, &model),
-            Some("high")
+            info.effort,
+            Some(ModelEffort {
+                supported: vec![Effort::Low, Effort::High],
+                send_off,
+            })
         );
-    }
-
-    #[test_case(false, false, None         ; "default_off_sends_nothing")]
-    #[test_case(true,  false, Some("none") ; "default_enabled_disables_with_none")]
-    #[test_case(true,  true,  None         ; "mandatory_cannot_be_disabled")]
-    fn off_resolves_per_reasoning_flags(
-        default_enabled: bool,
-        mandatory: bool,
-        expected: Option<&str>,
-    ) {
-        let info = OpenRouterModelInfo {
-            reasoning_mandatory: mandatory,
-            reasoning_default_enabled: default_enabled,
-            reasoning_efforts: vec![],
-        };
-        let (dialect, model) = openrouter_model(Some(&info));
-        assert_eq!(ThinkingConfig::Off.effort_str(&dialect, &model), expected);
     }
 
     #[test_case(json!(["image"]), json!(["image"]); "image_only")]
@@ -457,14 +333,15 @@ mod tests {
     }
 }
 
-/// The recorded cases, kept out of the test module so every authoring replays
-/// the same list: the bespoke [`OpenRouter`] records them, and the declaration
-/// that replaces it, Rust or bundled Lua, must replay them byte for byte.
+/// The recorded cases, kept out of the test module so both authorings replay
+/// the same list: [`decl`] plus [`hooks`], and the bundled `openrouter` Lua
+/// plugin.
 ///
-/// `provider_info` never reaches a golden, so the `models` listing alone shows
-/// only what the `reasoning` block did to `supports_thinking`. What it did to
-/// the effort dialect is pinned by the discovered turns, each of which lists
-/// the one catalog below and then asks one of its models for a thinking mode.
+/// [`ModelInfo::effort`] never reaches a golden, so the `models` listing alone
+/// shows only what the `reasoning` block did to `supports_thinking`. What it
+/// did to the effort dialect is pinned by the discovered turns, each of which
+/// lists the one catalog below and then asks one of its models for a thinking
+/// mode.
 #[cfg(any(test, feature = "test-support"))]
 pub mod fixtures {
     use crate::model::Model;
@@ -606,8 +483,8 @@ data: [DONE]
     }
 }
 
-/// The bespoke [`OpenRouter`] recording the exchanges its replacement has to
-/// reproduce.
+/// OpenRouter as [`decl`] plus [`hooks`] put it on the wire, one recorded
+/// exchange at a time.
 #[cfg(test)]
 mod replay_tests {
     use test_case::test_case;
@@ -630,14 +507,14 @@ mod replay_tests {
     #[test_case(&replay::MALFORMED_SSE ; "malformed_sse")]
     #[test_case(&replay::EMPTY_SSE_ERROR ; "empty_sse_error_frame")]
     #[test_case(&replay::TRUNCATED_STREAM ; "truncated_stream")]
-    fn the_bespoke_impl_records_the_exchange(fixture: &Fixture) {
-        replay::bespoke(SLUG).stream(fixture, &model(UNLISTED_SPEC));
+    fn the_declaration_replays_the_recorded_exchange(fixture: &Fixture) {
+        replay::declared(replay::rust_authoring, SLUG, fixture, &model(UNLISTED_SPEC));
     }
 
     #[test_case(&MODELS ; "models")]
     #[test_case(&MODELS_UNAUTHORIZED ; "models_unauthorized")]
-    fn the_bespoke_impl_records_the_listing(fixture: &Fixture) {
-        replay::bespoke(SLUG).models(fixture);
+    fn the_declaration_lists_the_recorded_catalog(fixture: &Fixture) {
+        replay::declared_models(replay::rust_authoring, SLUG, fixture);
     }
 
     #[test_case(&MAX_SNAPS_TO_XHIGH, XHIGH_SPEC ; "max_snaps_to_xhigh")]
@@ -650,7 +527,7 @@ mod replay_tests {
     #[test_case(&BUDGET, XHIGH_SPEC ; "budget")]
     #[test_case(&NOT_A_REASONING_MODEL, NO_REASONING_SPEC ; "not_a_reasoning_model")]
     #[test_case(&IN_SESSION, XHIGH_SPEC ; "in_session")]
-    fn the_bespoke_impl_records_the_discovered_turn(fixture: &Fixture, spec: &str) {
-        replay::bespoke(SLUG).discovered(fixture, &model(spec));
+    fn the_declaration_replays_the_discovered_turn(fixture: &Fixture, spec: &str) {
+        replay::declared_discovered(replay::rust_authoring, SLUG, fixture, &model(spec));
     }
 }

@@ -1,27 +1,39 @@
 use std::borrow::Cow;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
-use flume::Sender;
-use maki_storage::id::SessionRef;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use maki_config::providers::Protocol;
 
-use crate::model::{Model, ModelFamily, ModelInfo, ModelPricing};
-use crate::provider::{BoxFuture, Provider};
+use crate::model::{ModelFamily, ModelInfo, ModelPricing};
+use crate::provider::BoxFuture;
 use crate::providers::aperture::DEFAULT_PATH_PREFIX;
 use crate::spec::{
     ApertureRoute, AuthDoc, CatalogDoc, GENERIC_DISCOVERY_NOTE, GeneratedDocs, LoginConfig,
-    NO_CURATED_MODELS, Native, ProviderSpec,
+    NO_CURATED_MODELS, ProviderSpec,
 };
-use crate::{AgentError, Message, ProviderEvent, RequestOptions, StreamResponse, dialect};
+use crate::types::THINKING_OFF;
+use crate::{AgentError, dialect};
 
 use super::openai_compat::{OpenAiCompatConfig, OpenAiCompatProvider};
-use super::{KeyHeader, KeyPool, KeyRotation, ResolvedAuth, Timeouts, deepseek};
+use super::plugin::{
+    self, BodyInput, EffortField, Hook, OpenAiWire, ProviderDecl, ProviderHooks, ThinkingWire,
+};
+use super::{Timeouts, deepseek};
 
 /// TensorX namespaces resold models by vendor, so DeepSeek ids arrive as
 /// `deepseek/deepseek-flash`.
 const DEEPSEEK_VENDOR_PREFIX: &str = "deepseek/";
+const MODEL_INFO_PATH: &str = "/model/info";
+/// The name of the knob both in `supported_openai_params` and on the wire.
+const THINKING: &str = "thinking";
+/// Also where the declared dialect writes the effort, the codec's default.
+const REASONING_EFFORT: &str = "reasoning_effort";
+const TEMPLATE_KWARGS: &str = "chat_template_kwargs";
+const CHAT_MODE: &str = "chat";
+const PER_MILLION: f64 = 1_000_000.0;
+const NET_HOST: &str = "api.tensorx.ai";
 
 const SLUG: &str = "tensorx";
 const DISPLAY_NAME: &str = "TensorX";
@@ -52,10 +64,7 @@ pub(crate) const SPEC: ProviderSpec = ProviderSpec {
     fallback_context_window: 200_000,
     models_toml: NO_CURATED_MODELS,
     pricing_schedule: None,
-    native: Some(Native {
-        new: create,
-        with_auth: create_with_auth,
-    }),
+    native: None,
     aperture: Some(ApertureRoute {
         path_prefix: DEFAULT_PATH_PREFIX,
     }),
@@ -76,117 +85,66 @@ pub(crate) const SPEC: ProviderSpec = ProviderSpec {
     },
 };
 
-fn create(timeouts: Timeouts) -> Result<Box<dyn Provider>, AgentError> {
-    Ok(Box::new(TensorX::new(timeouts)?))
-}
-
-fn create_with_auth(
-    auth: Arc<Mutex<ResolvedAuth>>,
-    timeouts: Timeouts,
-    system_prefix: Option<String>,
-) -> Box<dyn Provider> {
-    Box::new(TensorX::with_auth(auth, timeouts).with_system_prefix(system_prefix))
-}
-
 inventory::submit!(SPEC.config_row());
 
-#[derive(Debug)]
-struct TensorXModelInfo {
+/// TensorX as a declaration, plus the two things the openai codec cannot
+/// spell, see [`hooks`].
+///
+/// The declared dialect writes `reasoning_effort` on every request, which is
+/// right for a model that advertises the knob and wrong for every other one,
+/// so the body hook takes it back off where discovery did not vouch for it.
+///
+/// The bundled `tensorx` Lua plugin says all of this again on the surface a
+/// third-party plugin uses, and outranks this at every real startup.
+pub(crate) fn decl() -> ProviderDecl {
+    ProviderDecl {
+        slug: SLUG.to_owned(),
+        display_name: None,
+        codec: Some(Protocol::Openai),
+        base: None,
+        base_url: Some(BASE_URL.to_owned()),
+        api_key_env: None,
+        system_prefix: None,
+        models: Vec::new(),
+        openai: Some(OpenAiWire {
+            thinking: Some(ThinkingWire {
+                dialect: &dialect::TENSORX,
+                field: EffortField::default(),
+                requires_support: false,
+            }),
+            ..OpenAiWire::default()
+        }),
+        net_hosts: vec![NET_HOST.to_owned()],
+    }
+}
+
+/// The two callbacks [`decl`] cannot spell, registered alongside it.
+pub(crate) fn hooks() -> ProviderHooks {
+    ProviderHooks {
+        list_models: Some(Arc::new(ModelCatalog)),
+        build_body: Some(Arc::new(ThinkingKnobs)),
+        ..ProviderHooks::default()
+    }
+}
+
+/// Which of the two thinking knobs a model lists in `supported_openai_params`,
+/// carried from the listing to the turn as [`ModelInfo::extra`].
+#[derive(Default, Serialize, Deserialize)]
+struct AdvertisedKnobs {
     has_thinking: bool,
     has_reasoning_effort: bool,
 }
 
-pub struct TensorX {
-    compat: OpenAiCompatProvider,
-    auth: Arc<Mutex<ResolvedAuth>>,
-    key_pool: Option<KeyPool>,
-    system_prefix: Option<String>,
-}
+/// `/model/info`, which sits off the codec's `/models` path.
+struct ModelCatalog;
 
-impl TensorX {
-    pub fn new(timeouts: super::Timeouts) -> Result<Self, AgentError> {
-        let pool = KeyPool::resolve(&CONFIG.slug, &CONFIG.api_key_env)?;
-        Ok(Self {
-            compat: OpenAiCompatProvider::new(&CONFIG, timeouts),
-            auth: Arc::new(Mutex::new(ResolvedAuth::bearer(
-                &CONFIG.slug,
-                pool.current(),
-            )?)),
-            key_pool: Some(pool),
-            system_prefix: None,
-        })
-    }
-
-    pub(crate) fn with_auth(auth: Arc<Mutex<ResolvedAuth>>, timeouts: super::Timeouts) -> Self {
-        Self {
-            compat: OpenAiCompatProvider::new(&CONFIG, timeouts),
-            auth,
-            key_pool: None,
-            system_prefix: None,
-        }
-    }
-
-    pub(crate) fn with_system_prefix(mut self, prefix: Option<String>) -> Self {
-        self.system_prefix = prefix;
-        self
-    }
-}
-
-impl Provider for TensorX {
-    fn stream_message<'a>(
-        &'a self,
-        model: &'a Model,
-        messages: &'a [Message],
-        system: &'a str,
-        tools: &'a Value,
-        event_tx: &'a Sender<ProviderEvent>,
-        opts: RequestOptions,
-        _session_id: Option<&'a SessionRef>,
-    ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
+impl Hook<(), Vec<ModelInfo>> for ModelCatalog {
+    fn call(&self, (): ()) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
         Box::pin(async move {
-            let auth = self.auth.lock().unwrap().clone();
-            let mut buf = String::new();
-            let system = super::with_prefix(&self.system_prefix, system, &mut buf);
-            let mut body = self.compat.build_body(model, messages, system, tools);
-
-            let (has_thinking, has_reasoning_effort) =
-                crate::model_registry::provider_info::<TensorXModelInfo>("tensorx", &model.id)
-                    .map_or((false, false), |info| {
-                        (info.has_thinking, info.has_reasoning_effort)
-                    });
-
-            if has_thinking {
-                body["thinking"] = json!(opts.thinking.is_enabled());
-            }
-            if has_reasoning_effort {
-                opts.thinking
-                    .apply_reasoning_effort(&mut body, &dialect::TENSORX, model);
-            }
-            // DeepSeek takes the toggle through the chat template and TensorX
-            // advertises neither knob for it. Sharing DeepSeek's own predicate
-            // means a rename upstream cannot quietly turn thinking off here.
-            else if !has_thinking
-                && opts.thinking.is_enabled()
-                && model
-                    .id
-                    .strip_prefix(DEEPSEEK_VENDOR_PREFIX)
-                    .is_some_and(deepseek::uses_v4_thinking_protocol)
-            {
-                body["chat_template_kwargs"] = json!({"thinking": true});
-            }
-
-            self.compat
-                .do_stream(model, &[], &body, event_tx, &auth)
-                .await
-        })
-    }
-
-    fn list_models(&self) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
-        Box::pin(async move {
-            let auth = self.auth.lock().unwrap().clone();
-            let url = format!("{}/model/info", self.compat.base_url(&auth));
-            let text = self.compat.get_text(&auth, &url).await?;
-            let body: Value = serde_json::from_str(&text)?;
+            let auth = plugin::registered_auth(SLUG)?;
+            let compat = OpenAiCompatProvider::new(&CONFIG, Timeouts::default());
+            let url = format!("{}{MODEL_INFO_PATH}", compat.base_url(&auth));
+            let body: Value = serde_json::from_str(&compat.get_text(&auth, &url).await?)?;
 
             let mut models: Vec<ModelInfo> = body["data"]
                 .as_array()
@@ -196,13 +154,49 @@ impl Provider for TensorX {
             Ok(models)
         })
     }
+}
 
-    fn keys(&self) -> Option<KeyRotation<'_>> {
-        Some(KeyRotation::new(
-            self.key_pool.as_ref()?,
-            &self.auth,
-            KeyHeader::Bearer,
-        ))
+/// Each knob goes on the wire only for a model that advertised it: `thinking`
+/// as a bool, `reasoning_effort` as the dialect rendered it. A DeepSeek model
+/// that advertises neither takes the toggle through its chat template instead.
+struct ThinkingKnobs;
+
+impl Hook<BodyInput, Value> for ThinkingKnobs {
+    fn call(&self, input: BodyInput) -> BoxFuture<'_, Result<Value, AgentError>> {
+        Box::pin(async move {
+            let BodyInput {
+                mut body,
+                model,
+                thinking,
+                model_info,
+            } = input;
+            let knobs: AdvertisedKnobs = model_info
+                .map(serde_json::from_value)
+                .transpose()?
+                .unwrap_or_default();
+            let enabled = thinking != THINKING_OFF;
+
+            if knobs.has_thinking {
+                body[THINKING] = json!(enabled);
+            }
+            if knobs.has_reasoning_effort {
+                return Ok(body);
+            }
+            if let Some(object) = body.as_object_mut() {
+                object.remove(REASONING_EFFORT);
+            }
+            // Sharing DeepSeek's own predicate means a rename upstream cannot
+            // quietly turn thinking off here.
+            if !knobs.has_thinking
+                && enabled
+                && model
+                    .strip_prefix(DEEPSEEK_VENDOR_PREFIX)
+                    .is_some_and(deepseek::uses_v4_thinking_protocol)
+            {
+                body[TEMPLATE_KWARGS] = json!({ THINKING: true });
+            }
+            Ok(body)
+        })
     }
 }
 
@@ -214,7 +208,7 @@ fn model_info(entry: &Value) -> Option<ModelInfo> {
     let mode_ok = info
         .get("mode")
         .and_then(|v| v.as_str())
-        .is_none_or(|m| m == "chat");
+        .is_none_or(|m| m == CHAT_MODE);
     if !mode_ok {
         return None;
     }
@@ -236,15 +230,14 @@ fn model_info(entry: &Value) -> Option<ModelInfo> {
     let input_cost = info["input_cost_per_token"].as_f64();
     let output_cost = info["output_cost_per_token"].as_f64();
     let pricing = if input_cost.is_some() || output_cost.is_some() {
-        let per_million = 1_000_000.0;
         Some(ModelPricing::per_million(
-            input_cost.unwrap_or(0.0) * per_million,
-            output_cost.unwrap_or(0.0) * per_million,
+            input_cost.unwrap_or(0.0) * PER_MILLION,
+            output_cost.unwrap_or(0.0) * PER_MILLION,
             info["cache_creation_input_token_cost"]
                 .as_f64()
                 .unwrap_or(0.0)
-                * per_million,
-            info["cache_read_input_token_cost"].as_f64().unwrap_or(0.0) * per_million,
+                * PER_MILLION,
+            info["cache_read_input_token_cost"].as_f64().unwrap_or(0.0) * PER_MILLION,
         ))
     } else {
         None
@@ -257,14 +250,12 @@ fn model_info(entry: &Value) -> Option<ModelInfo> {
 
     let supports_thinking = info.get("supports_reasoning").and_then(Value::as_bool);
 
-    let supported_params = info
+    let knobs = info
         .get("supported_openai_params")
         .and_then(Value::as_array)
-        .map(|params| TensorXModelInfo {
-            has_thinking: params.iter().any(|v| v.as_str() == Some("thinking")),
-            has_reasoning_effort: params
-                .iter()
-                .any(|v| v.as_str() == Some("reasoning_effort")),
+        .map(|params| AdvertisedKnobs {
+            has_thinking: params.iter().any(|v| v.as_str() == Some(THINKING)),
+            has_reasoning_effort: params.iter().any(|v| v.as_str() == Some(REASONING_EFFORT)),
         });
 
     Some(ModelInfo {
@@ -275,14 +266,15 @@ fn model_info(entry: &Value) -> Option<ModelInfo> {
         supports_thinking,
         supports_vision: Some(supports_vision),
         tier: None,
-        provider_info: supported_params
-            .map(|p| Arc::new(p) as Arc<dyn std::any::Any + Send + Sync>),
+        provider_info: None,
+        extra: knobs.map(|knobs| json!(knobs)),
+        effort: None,
     })
 }
 
-/// The recorded cases, kept out of the test modules so every authoring replays
-/// the same list. They are recorded against the bespoke [`TensorX`] impl, and
-/// the artifacts stay the spec once it is gone.
+/// The recorded cases, kept out of the test modules so both authorings replay
+/// the same list: [`decl`] plus [`hooks`], and the bundled `tensorx` Lua
+/// plugin.
 ///
 /// What a turn puts on the wire depends on what `/model/info` said about the
 /// model, so every stream fixture past the shared failures is a discovery
@@ -472,7 +464,8 @@ mod tests {
     }
 }
 
-/// The bespoke [`TensorX`] on the wire, one recorded exchange at a time.
+/// TensorX as [`decl`] plus [`hooks`] put it on the wire, one recorded
+/// exchange at a time.
 #[cfg(test)]
 mod replay_tests {
     use test_case::test_case;
@@ -489,17 +482,25 @@ mod replay_tests {
     #[test_case(&replay::MALFORMED_SSE ; "malformed_sse")]
     #[test_case(&replay::EMPTY_SSE_ERROR ; "empty_sse_error_frame")]
     #[test_case(&replay::TRUNCATED_STREAM ; "truncated_stream")]
-    fn the_bespoke_impl_replays_the_recorded_exchange(fixture: &Fixture) {
-        replay::bespoke(SLUG).stream(fixture, &fixtures::model(fixtures::UNLISTED_SPEC));
+    fn the_declaration_replays_the_recorded_exchange(fixture: &Fixture) {
+        replay::declared(
+            replay::rust_authoring,
+            SLUG,
+            fixture,
+            &fixtures::model(fixtures::UNLISTED_SPEC),
+        );
     }
 
     #[test_case(&fixtures::MODELS ; "models")]
     #[test_case(&fixtures::MODELS_WITHOUT_DATA ; "models_without_data")]
     #[test_case(&fixtures::MODELS_UNAUTHORIZED ; "models_unauthorized")]
-    fn the_bespoke_impl_lists_the_recorded_catalogue(fixture: &Fixture) {
-        replay::bespoke(SLUG).models(fixture);
+    fn the_declaration_lists_the_recorded_catalogue(fixture: &Fixture) {
+        replay::declared_models(replay::rust_authoring, SLUG, fixture);
     }
 
+    /// The knobs travel from the listing to the turn through
+    /// [`crate::model::ModelInfo::extra`], which no listing golden records, so
+    /// these bodies are the only thing that pins it.
     #[test_case(&fixtures::THINKING_PARAM, fixtures::THINKING_PARAM_SPEC ; "thinking_param")]
     #[test_case(&fixtures::THINKING_PARAM_OFF, fixtures::THINKING_PARAM_SPEC ; "thinking_param_off")]
     #[test_case(&fixtures::REASONING_EFFORT, fixtures::REASONING_EFFORT_SPEC ; "reasoning_effort")]
@@ -510,7 +511,12 @@ mod replay_tests {
     #[test_case(&fixtures::DEEPSEEK_REASONER, fixtures::DEEPSEEK_REASONER_SPEC ; "deepseek_reasoner")]
     #[test_case(&fixtures::UNDISCOVERED, fixtures::UNLISTED_SPEC ; "undiscovered")]
     #[test_case(&fixtures::UNDISCOVERED_DEEPSEEK_V4, fixtures::UNLISTED_DEEPSEEK_V4_SPEC ; "undiscovered_deepseek_v4")]
-    fn the_bespoke_impl_shapes_the_turn_by_what_discovery_found(fixture: &Fixture, spec: &str) {
-        replay::bespoke(SLUG).discovered(fixture, &fixtures::model(spec));
+    fn the_declaration_shapes_the_turn_by_what_discovery_found(fixture: &Fixture, spec: &str) {
+        replay::declared_discovered(
+            replay::rust_authoring,
+            SLUG,
+            fixture,
+            &fixtures::model(spec),
+        );
     }
 }

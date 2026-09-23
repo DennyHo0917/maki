@@ -230,8 +230,10 @@ fn the_bundled_deepseek_plugin_pads_the_same_turns(
 /// The balance endpoint, which is the one hook that leaves the codec's request
 /// path: the Lua authoring reaches it through `maki.net`, under the plugin's
 /// own declared hosts, and the golden says it asked the same server the same
-/// question as the Rust one.
-#[test]
-fn the_bundled_deepseek_plugin_reads_the_balance_endpoint() {
-    replay::declared_usage(bundled(DEEPSEEK), DEEPSEEK, &deepseek::BALANCE);
+/// question as the Rust one. A refused request is returned through
+/// `maki.provider.http_error`, so it fails with the Rust one's error too.
+#[test_case(&deepseek::BALANCE ; "balance")]
+#[test_case(&deepseek::USER_BALANCE_UNAUTHORIZED ; "unauthorized")]
+fn the_bundled_deepseek_plugin_reads_the_balance_endpoint(fixture: &Fixture) {
+    replay::declared_usage(bundled(DEEPSEEK), DEEPSEEK, fixture);
 }

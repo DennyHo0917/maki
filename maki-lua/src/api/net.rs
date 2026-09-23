@@ -6,6 +6,7 @@ use std::time::Duration;
 use arc_swap::ArcSwap;
 use futures_lite::io::AsyncReadExt;
 use isahc::config::{Configurable, RedirectPolicy, ResolveMap, VersionNegotiation};
+use isahc::http::HeaderMap;
 use isahc::{AsyncBody, HttpClient, Request, Response};
 
 use maki_lua_macro::{lua_fn, lua_table};
@@ -34,6 +35,7 @@ const DNS_ATTEMPTS: u32 = 3;
 const DNS_RETRY_DELAY: Duration = Duration::from_millis(150);
 /// Methods whose requests carry no body at all when the caller gave none.
 const BODYLESS_METHODS: &[&str] = &["GET", "HEAD"];
+const HEADER_VALUE_SEPARATOR: &str = ", ";
 const ALLOWLIST_HINT: &str = "add it to `net.allowed_private_hosts` in your init.lua to allow it";
 const UNDECLARED_HOST_HINT: &str = "add it to `net_hosts` under `[permissions]` in plugin.toml";
 /// Reserved IPv4 ranges the standard library has no predicate for. Carrier
@@ -208,6 +210,37 @@ struct ResponseData {
     body: String,
     status: u16,
     content_type: String,
+    headers: Vec<(String, String)>,
+}
+
+impl ResponseData {
+    fn into_table(self, lua: &Lua) -> LuaResult<Table> {
+        let tbl = lua.create_table()?;
+        tbl.set("body", self.body)?;
+        tbl.set("status", self.status)?;
+        tbl.set("content_type", self.content_type)?;
+        tbl.set("headers", lua.create_table_from(self.headers)?)?;
+        Ok(tbl)
+    }
+}
+
+/// `http` already keeps names in lowercase. A header sent more than once is
+/// joined into one value, as RFC 9110 allows, which mangles `set-cookie`
+/// because its values hold commas. Bytes that are not UTF-8 become U+FFFD
+/// rather than dropping the header, so a lookup does not quietly miss it.
+fn collect_headers(headers: &HeaderMap) -> Vec<(String, String)> {
+    headers
+        .keys()
+        .map(|name| {
+            let value = headers
+                .get_all(name)
+                .iter()
+                .map(|value| String::from_utf8_lossy(value.as_bytes()))
+                .collect::<Vec<_>>()
+                .join(HEADER_VALUE_SEPARATOR);
+            (name.as_str().to_owned(), value)
+        })
+        .collect()
 }
 
 /// Make an HTTP request and return the response body. Plain `http://`
@@ -223,8 +256,12 @@ struct ResponseData {
 ///   `max_bytes` (integer) Max response size in bytes (default 5 MB).
 ///   `retry` (integer) Retries on 5xx errors (default 3).
 ///
-/// The response table has three fields: `body` (string), `status`
-/// (integer), and `content_type` (string).
+/// The response table has `body` (string), `status` (integer),
+/// `content_type` (string) and `headers` (table). `headers` comes from the
+/// final response after redirects and is keyed by lowercase name, as in
+/// `res.headers["retry-after"]`. A header sent more than once has its values
+/// joined with `, `, which mangles `set-cookie`. Bytes that are not UTF-8
+/// become U+FFFD. The table can go straight to `maki.provider.http_error`.
 ///
 /// @param url string URL starting with `http://` or `https://`.
 /// @param opts table? Request options (see above).
@@ -245,11 +282,7 @@ async fn request(
 ) -> LuaResult<Pair<Table>> {
     let params = try_pair!(extract_request_params(&url, egress, opts.as_ref()).await);
     let resp = try_pair!(do_request(params).await);
-    let tbl = lua.create_table()?;
-    tbl.set("body", resp.body)?;
-    tbl.set("status", resp.status)?;
-    tbl.set("content_type", resp.content_type)?;
-    Ok((Some(tbl), None))
+    Ok((Some(resp.into_table(&lua)?), None))
 }
 
 lua_table! {
@@ -535,6 +568,7 @@ async fn do_request(mut params: RequestParams) -> Result<ResponseData, String> {
         body,
         status,
         content_type,
+        headers: collect_headers(response.headers()),
     })
 }
 
@@ -735,6 +769,8 @@ fn validate_and_upgrade_url(url: &str, allowed: &HostAllowlist) -> Result<String
 mod tests {
     use super::*;
     use crate::plugin_permissions::PluginPermissions;
+    use isahc::http::{HeaderName, HeaderValue};
+    use std::collections::HashMap;
     use std::net::Ipv6Addr;
     use test_case::test_case;
 
@@ -768,6 +804,18 @@ mod tests {
     const AUTH_VALUE: &str = "Bearer tok";
     const ACCEPT_HEADER: &str = "Accept";
     const ACCEPT_VALUE: &str = "text/html";
+    const RETRY_AFTER_HEADER: &str = "Retry-After";
+    const RETRY_AFTER_KEY: &str = "retry-after";
+    const RETRY_AFTER_SECS: &str = "30";
+    const VARY_HEADER: &str = "vary";
+    const VARY_FIRST: &str = "Accept";
+    const VARY_SECOND: &str = "Origin";
+    const VARY_JOINED: &str = "Accept, Origin";
+    const LATIN1_HEADER: &str = "x-name";
+    const LATIN1_BYTES: &[u8] = b"caf\xe9";
+    const LATIN1_LOSSY: &str = "caf\u{FFFD}";
+    const JSON_CONTENT_TYPE: &str = "application/json";
+    const TOO_MANY_REQUESTS: u16 = 429;
 
     fn allowlist(entries: &[&str]) -> HostAllowlist {
         HostAllowlist::parse(&entries.iter().map(|e| (*e).to_string()).collect::<Vec<_>>())
@@ -1183,6 +1231,49 @@ mod tests {
     fn extract_params_http_upgraded_to_https() {
         let params = request_params(PUBLIC_HTTP_URL, None).unwrap();
         assert_eq!(params.url, PUBLIC_URL);
+    }
+
+    #[test_case(&[(RETRY_AFTER_HEADER, RETRY_AFTER_SECS.as_bytes())], &[(RETRY_AFTER_KEY, RETRY_AFTER_SECS)] ; "name_is_lowercased")]
+    #[test_case(&[(VARY_HEADER, VARY_FIRST.as_bytes()), (VARY_HEADER, VARY_SECOND.as_bytes())], &[(VARY_HEADER, VARY_JOINED)] ; "repeated_header_is_joined")]
+    #[test_case(&[(LATIN1_HEADER, LATIN1_BYTES)], &[(LATIN1_HEADER, LATIN1_LOSSY)] ; "non_utf8_value_is_replaced_not_dropped")]
+    fn collect_headers_cases(sent: &[(&str, &[u8])], expected: &[(&str, &str)]) {
+        let mut headers = HeaderMap::new();
+        for (name, value) in sent {
+            headers.append(
+                HeaderName::from_bytes(name.as_bytes()).unwrap(),
+                HeaderValue::from_bytes(value).unwrap(),
+            );
+        }
+        let collected: HashMap<String, String> = collect_headers(&headers).into_iter().collect();
+        let expected: HashMap<String, String> = expected
+            .iter()
+            .map(|(name, value)| ((*name).to_owned(), (*value).to_owned()))
+            .collect();
+        assert_eq!(collected, expected);
+    }
+
+    #[test]
+    fn response_table_exposes_headers_by_lowercase_name() {
+        let lua = Lua::new();
+        let response = ResponseData {
+            body: PAYLOAD.to_owned(),
+            status: TOO_MANY_REQUESTS,
+            content_type: JSON_CONTENT_TYPE.to_owned(),
+            headers: vec![(RETRY_AFTER_KEY.to_owned(), RETRY_AFTER_SECS.to_owned())],
+        };
+        lua.globals()
+            .set("res", response.into_table(&lua).unwrap())
+            .unwrap();
+        let (status, body, content_type, retry_after): (u16, String, String, String) = lua
+            .load(format!(
+                r#"return res.status, res.body, res.content_type, res.headers["{RETRY_AFTER_KEY}"]"#
+            ))
+            .eval()
+            .unwrap();
+        assert_eq!(status, TOO_MANY_REQUESTS);
+        assert_eq!(body, PAYLOAD);
+        assert_eq!(content_type, JSON_CONTENT_TYPE);
+        assert_eq!(retry_after, RETRY_AFTER_SECS);
     }
 
     #[test]

@@ -18,8 +18,8 @@ use maki_storage::auth::{
     delete_plugin_auth, load_plugin_auth, lock_credentials, save_plugin_auth,
 };
 use mlua::{
-    Function, Lua, LuaSerdeExt, MultiValue, RegistryKey, Result as LuaResult, Table,
-    Value as LuaValue,
+    Function, Lua, LuaSerdeExt, MetaMethod, MultiValue, RegistryKey, Result as LuaResult, Table,
+    UserData, UserDataMethods, Value as LuaValue,
 };
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -57,6 +57,7 @@ const STATUS_FIELD: &str = "status";
 const MESSAGE_FIELD: &str = "message";
 
 const REGISTER: &str = "maki.provider.register";
+const HTTP_ERROR: &str = "maki.provider.http_error";
 const NO_NET_HOSTS: &str = "declare the hosts this provider talks to as `net_hosts` under \
      `[permissions]` in plugin.toml before registering";
 const API_KEY_ENV_NEEDS_ENV: &str = "`api_key_env` reads the environment, which needs `env = true` \
@@ -255,7 +256,11 @@ where
                     cancel,
                     deadline: self.timeout.map(|limit| Instant::now() + limit),
                     answer: Box::new(move |lua, returned| {
-                        let _ = reply.send(returned.and_then(|value| decode::<Out>(lua, value)));
+                        let _ = reply.send(
+                            returned
+                                .map_err(HookFailure::Broken)
+                                .and_then(|returned| decode::<Out>(lua, returned)),
+                        );
                     }),
                 })
                 .map_err(|_| AgentError::Channel)?;
@@ -270,11 +275,14 @@ where
                 }
                 None => answered.await?,
             };
-            value.map_err(|message| AgentError::Config {
-                message: format!(
-                    "provider '{}': {:?} hook failed: {message}",
-                    self.keys.slug, self.slot
-                ),
+            value.map_err(|failure| match failure {
+                HookFailure::Reported(error) => error,
+                HookFailure::Broken(message) => AgentError::Config {
+                    message: format!(
+                        "provider '{}': {:?} hook failed: {message}",
+                        self.keys.slug, self.slot
+                    ),
+                },
             })
         })
     }
@@ -284,11 +292,35 @@ where
 /// value into the type the caller asked for and sends it off.
 pub(crate) type HookAnswer = Box<dyn FnOnce(&Lua, Result<HookReturn, String>) + Send>;
 
-/// A hook's return value, still a Lua value, plus the JSON it refines when the
-/// slot hands a document to the hook and expects it back.
-pub(crate) struct HookReturn {
-    value: LuaValue,
-    template: Option<Value>,
+/// What a hook answered, still on the Lua side of the bridge.
+pub(crate) enum HookReturn {
+    /// A return value, still a Lua value, plus the JSON it refines when the
+    /// slot hands a document to the hook and expects it back.
+    Value {
+        value: LuaValue,
+        template: Option<Value>,
+    },
+    /// The hook returned a [`ProviderError`] second.
+    Failed(AgentError),
+}
+
+#[derive(Debug)]
+enum HookFailure {
+    /// The hook raised, or returned something we cannot decode. It becomes a
+    /// config error, so it is loud and never looks like success.
+    Broken(String),
+    /// The hook failed on purpose. Its error goes through untouched, so
+    /// retries and `retry_after` work the same as for a native provider.
+    Reported(AgentError),
+}
+
+/// Opaque to Lua: a hook only gets it from `http_error` and hands it back.
+struct ProviderError(AgentError);
+
+impl UserData for ProviderError {
+    fn add_methods<M: UserDataMethods<Self>>(methods: &mut M) {
+        methods.add_meta_method(MetaMethod::ToString, |_, this, ()| Ok(this.0.to_string()));
+    }
 }
 
 /// Decoded straight into `Out` while it is still a Lua value, because only the
@@ -298,13 +330,18 @@ pub(crate) struct HookReturn {
 ///
 /// A returned document is the exception: it is refined against the one that
 /// went in, which is what keeps the fields the hook never touched.
-fn decode<Out: DeserializeOwned>(lua: &Lua, returned: HookReturn) -> Result<Out, String> {
-    match &returned.template {
-        Some(template) => lua_to_json_within(lua, &returned.value, template)
+fn decode<Out: DeserializeOwned>(lua: &Lua, returned: HookReturn) -> Result<Out, HookFailure> {
+    let (value, template) = match returned {
+        HookReturn::Value { value, template } => (value, template),
+        HookReturn::Failed(error) => return Err(HookFailure::Reported(error)),
+    };
+    match &template {
+        Some(template) => lua_to_json_within(lua, &value, template)
             .map_err(|e| e.to_string())
             .and_then(|json| serde_json::from_value(json).map_err(|e| e.to_string())),
-        None => lua.from_value(returned.value).map_err(|e| e.to_string()),
+        None => lua.from_value(value).map_err(|e| e.to_string()),
     }
+    .map_err(HookFailure::Broken)
 }
 
 impl<In, Out> LuaHook<In, Out> {
@@ -344,6 +381,10 @@ where
 
 /// Runs one hook call on the Lua thread, under the scope its caller set up:
 /// JSON in, Lua arguments, the Lua return value back out for [`decode`].
+///
+/// Any hook can fail with `return nil, err` where `err` is a [`ProviderError`].
+/// Only our own userdata counts there. A plain string beside a nil means what
+/// it always meant: the nil is the answer.
 pub(crate) async fn run_hook(
     lua: &Lua,
     keys: &LuaHookKeys,
@@ -357,9 +398,18 @@ pub(crate) async fn run_hook(
     let spec = slot.spec();
     let template = spec.refines.and_then(|field| payload.get(field).cloned());
     let args = call_args(lua, spec, payload).map_err(|e| e.to_string())?;
-    let call = async { lua.create_thread(func)?.into_async::<LuaValue>(args)?.await };
-    let value = call.await.map_err(|e| e.to_string())?;
-    Ok(HookReturn { value, template })
+    let call = async {
+        lua.create_thread(func)?
+            .into_async::<(LuaValue, LuaValue)>(args)?
+            .await
+    };
+    let (value, second) = call.await.map_err(|e| e.to_string())?;
+    if let LuaValue::UserData(reported) = second
+        && let Ok(ProviderError(error)) = reported.take::<ProviderError>()
+    {
+        return Ok(HookReturn::Failed(error));
+    }
+    Ok(HookReturn::Value { value, template })
 }
 
 fn call_args(lua: &Lua, spec: SlotSpec, payload: Value) -> LuaResult<MultiValue> {
@@ -497,7 +547,8 @@ fn owned(slugs: &OwnedSlugs, slug: &str) -> LuaResult<()> {
 ///
 /// Every callback is optional, and a registration with none is a perfectly
 /// good static provider. Callbacks run on maki's plugin host, so they may use
-/// `maki.net`, `maki.fs` and the rest of the API.
+/// `maki.net`, `maki.fs` and the rest of the API. A callback that fails on an
+/// HTTP response returns `nil, maki.provider.http_error(res)`.
 ///
 /// An option the target cannot honour fails at registration rather than being
 /// ignored at request time: `build_body` needs one of the `openai` codecs, the
@@ -734,6 +785,48 @@ fn hook_entry(name: &str) -> Option<&'static str> {
         .find(|entry| *entry == name)
 }
 
+/// Turn a failed `maki.net.request` response into the error maki's own
+/// providers raise for it. Any hook can return it second: `return nil, err`.
+///
+/// maki then treats it like a native provider's failure. A 429 or a 5xx is
+/// retried, `retry-after` sets the wait, and the user sees the same message.
+/// A hook that raises instead fails as a broken hook.
+///
+/// {res} fields:
+///   `status` (integer) Required. The HTTP status.
+///   `body` (string) Required. The response body, kept as the error message.
+///   `headers` (table) Header name to value, matched case-insensitively. Only
+///           `retry-after` is read.
+///
+/// @param res table A response from `maki.net.request`.
+/// @return (userdata) A `ProviderError`. Opaque, but `tostring` renders it.
+/// @example
+/// fetch_usage = function()
+///   local res = assert(maki.net.request(url, { headers = auth.headers }))
+///   if res.status ~= 200 then
+///     return nil, maki.provider.http_error(res)
+///   end
+///   return { limits = {} }
+/// end
+#[lua_fn]
+fn http_error(_lua: &Lua, res: Table) -> LuaResult<ProviderError> {
+    let malformed = |e: mlua::Error| mlua::Error::runtime(format!("{HTTP_ERROR}: {e}"));
+    let status: u16 = res.get(STATUS_FIELD).map_err(malformed)?;
+    let body: String = res.get(BODY_FIELD).map_err(malformed)?;
+    let headers: HashMap<String, String> = res
+        .get::<Option<HashMap<String, String>>>(HEADERS)
+        .map_err(malformed)?
+        .unwrap_or_default()
+        .into_iter()
+        .map(|(name, value)| (name.to_ascii_lowercase(), value))
+        .collect();
+    Ok(ProviderError(AgentError::from_parts(
+        status,
+        |name| headers.get(name).map(String::as_str),
+        body,
+    )))
+}
+
 /// Read the credentials this plugin stored for one of its providers.
 ///
 /// The value is whatever the plugin wrote. maki keeps the file, the plugin
@@ -935,6 +1028,7 @@ lua_table! {
     /// ```
     "maki.provider" => pub(crate) fn create_provider_table(perms: &PluginPermissions, plugin: Arc<str>, egress: NetEgress, authority: DeclAuthority, reads_env: bool), DOCS [
         register(perms, plugin, egress, authority, reads_env),
+        http_error,
     ]
 }
 
@@ -976,6 +1070,13 @@ mod tests {
     const STRAY_KEY: &str = "thinking_dialect";
     const TRANSPORT_HEADER: &str = "Host";
     const BAD_HEADER: &str = "bad header";
+    const FAILED_BODY: &str = r#"{"error":{"message":"slow down"}}"#;
+    const RETRY_AFTER: &str = "Retry-After";
+    const RETRY_AFTER_SECS: &str = "7";
+    const UNAUTHORIZED: u16 = 401;
+    const RATE_LIMITED: u16 = 429;
+    const HOOK_ERROR: &str = "balance unavailable";
+    const HOOK_NEVER_CALLED: &str = "the hook call never reached the host";
 
     fn keys_from(
         lua: &Lua,
@@ -1125,7 +1226,7 @@ mod tests {
 
         let usage: ProviderUsage = decode(
             &lua,
-            HookReturn {
+            HookReturn::Value {
                 value,
                 template: None,
             },
@@ -1133,6 +1234,92 @@ mod tests {
         .unwrap();
 
         assert!(usage.limits.is_empty());
+    }
+
+    fn lua_response(status: u16, retry_after: Option<&str>) -> String {
+        let headers = retry_after
+            .map(|secs| format!(r#", headers = {{ ["{RETRY_AFTER}"] = "{secs}" }}"#))
+            .unwrap_or_default();
+        format!("{{ status = {status}, body = [[{FAILED_BODY}]]{headers} }}")
+    }
+
+    fn native_error(status: u16, retry_after: Option<&str>) -> AgentError {
+        AgentError::from_parts(
+            status,
+            |name| retry_after.filter(|_| name.eq_ignore_ascii_case(RETRY_AFTER)),
+            FAILED_BODY.to_owned(),
+        )
+    }
+
+    /// `AgentError` has no `PartialEq`, but its debug output shows every field.
+    fn assert_same_error(left: &AgentError, right: &AgentError) {
+        assert_eq!(format!("{left:?}"), format!("{right:?}"));
+    }
+
+    /// Runs `source`, which evaluates to a function, as a `fetch_usage` hook
+    /// through the whole bridge: [`LuaHook::call`] on the caller's side, the
+    /// host's [`run_hook`] on the other.
+    fn call_usage_hook(source: &str) -> Result<Option<ProviderUsage>, AgentError> {
+        let lua = provider_lua(true);
+        let func: Function = lua.load(source).eval().unwrap();
+        let (requests, served) = flume::unbounded();
+        let mut keys = keys_from(&lua, [(FETCH_USAGE, func)]);
+        keys.requests = requests;
+        let bridge: LuaHook<(), Option<ProviderUsage>> = LuaHook {
+            keys: Arc::new(keys),
+            slot: HookSlot::FetchUsage,
+            timeout: None,
+            _types: PhantomData,
+        };
+        let host = async {
+            let Ok(Request::CallProviderHook {
+                hook,
+                slot,
+                payload,
+                answer,
+                ..
+            }) = served.recv_async().await
+            else {
+                panic!("{HOOK_NEVER_CALLED}");
+            };
+            answer(&lua, run_hook(&lua, &hook, slot, payload).await);
+        };
+        smol::block_on(futures_lite::future::zip(bridge.call(()), host)).0
+    }
+
+    /// The header is spelled `Retry-After`, the way servers send it, to show
+    /// that `http_error` still finds it.
+    #[test_case(UNAUTHORIZED, None ; "unauthorized")]
+    #[test_case(RATE_LIMITED, Some(RETRY_AFTER_SECS) ; "rate_limited_with_retry_after")]
+    fn a_returned_http_error_is_the_native_error(status: u16, retry_after: Option<&str>) {
+        let source = format!(
+            "return function() return nil, provider.http_error({}) end",
+            lua_response(status, retry_after)
+        );
+
+        let error = call_usage_hook(&source).unwrap_err();
+
+        assert_same_error(&error, &native_error(status, retry_after));
+    }
+
+    /// Only our own userdata is a reported failure. A string beside a nil means
+    /// what it always did: the nil is the answer, and a nil usage shows nothing.
+    #[test]
+    fn a_returned_string_error_is_not_a_reported_failure() {
+        let source = format!(r#"return function() return nil, "{HOOK_ERROR}" end"#);
+        assert!(call_usage_hook(&source).unwrap().is_none());
+    }
+
+    #[test]
+    fn a_raised_error_is_still_a_broken_hook() {
+        let source = format!(r#"return function() error("{HOOK_ERROR}") end"#);
+
+        let error = call_usage_hook(&source).unwrap_err();
+
+        assert!(
+            matches!(&error, AgentError::Config { message } if message.contains(HOOK_ERROR)),
+            "{error:?}"
+        );
     }
 
     fn auth_table(lua: &Lua, owns: &[&str]) -> Table {
@@ -1248,9 +1435,9 @@ mod tests {
         assert!(error.contains(culprit), "{error}");
     }
 
-    /// Registers `extra` on top of a minimal spec, for a registration that has
-    /// to be refused, and hands back why it was.
-    fn register_refusal(reads_env: bool, extra: &str) -> String {
+    /// A Lua state with the real `maki.provider` table as the global
+    /// `provider`.
+    fn provider_lua(reads_env: bool) -> Lua {
         let lua = Lua::new();
         let table = create_provider_table(
             &lua,
@@ -1262,13 +1449,19 @@ mod tests {
         )
         .unwrap();
         lua.globals().set("provider", table).unwrap();
+        lua
+    }
 
-        lua.load(format!(
-            r#"provider.register({{ slug = "{SLUG_NAME}", display_name = "Acme", codec = "openai"{extra} }})"#
-        ))
-        .exec()
-        .unwrap_err()
-        .to_string()
+    /// Registers `extra` on top of a minimal spec, for a registration that has
+    /// to be refused, and hands back why it was.
+    fn register_refusal(reads_env: bool, extra: &str) -> String {
+        provider_lua(reads_env)
+            .load(format!(
+                r#"provider.register({{ slug = "{SLUG_NAME}", display_name = "Acme", codec = "openai"{extra} }})"#
+            ))
+            .exec()
+            .unwrap_err()
+            .to_string()
     }
 
     /// A provider that names no host would have maki send its credentials

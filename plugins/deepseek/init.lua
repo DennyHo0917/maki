@@ -6,7 +6,6 @@
 
 local SLUG = "deepseek"
 local BALANCE_PATH = "/user/balance"
-local BALANCE_FAILED = "deepseek balance request failed with %d: %s"
 -- `opts.thinking` arrives rendered, and this is the one rendering that means
 -- disabled: every effort level spells itself, `adaptive` spells itself, and a
 -- budget arrives as its bare token count.
@@ -74,12 +73,13 @@ maki.provider.register({
   -- Not on the codec's request path, so this hook resolves the credentials and
   -- the origin itself. Reading the origin rather than hard-coding one keeps a
   -- user who points the slug at a gateway from having their balance read
-  -- straight from DeepSeek with the gateway's key.
+  -- straight from DeepSeek with the gateway's key. A refused request is
+  -- returned rather than raised, so it fails the way the native provider does.
   fetch_usage = function()
     local auth = assert(maki.provider.auth.resolved(SLUG))
     local res = assert(maki.net.request(auth.base_url .. BALANCE_PATH, { headers = auth.headers }))
     if res.status ~= HTTP_OK then
-      error(string.format(BALANCE_FAILED, res.status, res.body))
+      return nil, maki.provider.http_error(res)
     end
     local parsed = assert(maki.json.decode(res.body))
 

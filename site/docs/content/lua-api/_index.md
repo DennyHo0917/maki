@@ -3595,8 +3595,12 @@ listed in `net.allowed_private_hosts`.
   `max_bytes` (integer) Max response size in bytes (default 5 MB).
   `retry` (integer) Retries on 5xx errors (default 3).
 
-The response table has three fields: `body` (string), `status`
-(integer), and `content_type` (string).
+The response table has `body` (string), `status` (integer),
+`content_type` (string) and `headers` (table). `headers` comes from the
+final response after redirects and is keyed by lowercase name, as in
+`res.headers["retry-after"]`. A header sent more than once has its values
+joined with `, `, which mangles `set-cookie`. Bytes that are not UTF-8
+become U+FFFD. The table can go straight to `maki.provider.http_error`.
 
 Requires the `net` [plugin permission](#plugin-permissions).
 
@@ -3674,11 +3678,13 @@ changes whenever that provider does.
 
 Every callback is optional, and a registration with none is a perfectly
 good static provider. Callbacks run on maki's plugin host, so they may use
-`maki.net`, `maki.fs` and the rest of the API.
+`maki.net`, `maki.fs` and the rest of the API. A callback that fails on an
+HTTP response returns `nil, maki.provider.http_error(res)`.
 
 An option the target cannot honour fails at registration rather than being
-ignored at request time: `build_body` needs one of the `openai` codecs, and
-`system_prefix` is refused by the `google` codec, which drops it.
+ignored at request time: `build_body` needs one of the `openai` codecs, the
+`openai` table needs `codec = "openai"`, and `system_prefix` is refused by
+the `google` codec, which drops it. So does a key this list does not name.
 
 {spec} fields:
   `slug` (string) Required. How the provider is addressed: `<slug>/<model>`.
@@ -3705,15 +3711,34 @@ ignored at request time: `build_body` needs one of the `openai` codecs, and
           Re-read every time maki builds the provider, so a key set or
           replaced since is picked up.
   `system_prefix` (string) Text prepended to the system prompt.
-  `max_tokens_field` (string) Body field carrying the output cap. Defaults
-          to `max_tokens`.
-  `include_stream_usage` (boolean) Whether to ask for usage on the stream.
-          Defaults to `true`.
-  `thinking_dialect` (string) Names the provider's effort dialect, one of
-          `"standard"`, `"codex"`, `"codex-5-1"`, `"coding-plan"`,
-          `"gpt-5-6"`, `"gpt-6"`, `"prefer-high"`, `"high-only"`, `"glm"`,
-          `"deepseek"`, `"anthropic-adaptive"`, `"tensorx"`, `"grok"` or
-          `"ollama"`. Omitting it sends no effort field.
+  `openai` (table) How the `openai` codec speaks to this provider. Every
+          key is optional:
+    `max_tokens_field` (string) Body field carrying the output cap.
+            Defaults to `max_tokens`.
+    `include_stream_usage` (boolean) Whether to ask for usage on the
+            stream. Defaults to `true`.
+    `thinking` (table) How the API spells reasoning effort. Omitting it
+            leaves effort to each model's `thinking_fields`.
+      `dialect` (string) Required. The provider's effort dialect, one of
+              `"standard"`, `"codex"`, `"codex-5-1"`, `"coding-plan"`,
+              `"gpt-5-6"`, `"gpt-6"`, `"prefer-high"`, `"high-only"`,
+              `"glm"`, `"deepseek"`, `"anthropic-adaptive"`, `"tensorx"`,
+              `"grok"` or `"ollama"`.
+      `field` (string) Where the effort goes in the body. A dotted path
+              nests, e.g. `"reasoning.effort"`. Defaults to
+              `reasoning_effort`.
+      `requires_support` (boolean) Send effort only to models that
+              support thinking. Defaults to `false`.
+    `headers` (table) Header name to value, sent with every request. A
+            header the credentials already set keeps its value, and
+            `host`, `content-length`, `transfer-encoding` and `connection`
+            are refused.
+    `extra_body` (table) Merged into every request body.
+    `session_id` (table) Sends the session id, as
+            `{ header = "x-affinity" }` or `{ body_field = "session_id" }`.
+    `thinking_overrides` (table) Model id prefix to `"no"`, `"yes"` or
+            `"required"`, overriding what the model table says about
+            thinking. The longest matching prefix wins.
   `models` (table) List of model rows. Each row has `prefixes` (list): the
            row answers for every model id starting with one of them,
            longest prefix first, and `prefixes[1]` is the canonical id.
@@ -3785,6 +3810,45 @@ maki.provider.register({
     return { headers = { Authorization = "Bearer " .. token.access } }
   end,
 })
+```
+
+---
+
+### `maki.provider.http_error()` {#maki-provider-http_error}
+
+```lua
+maki.provider.http_error({res})
+```
+
+Turn a failed `maki.net.request` response into the error maki's own
+providers raise for it. Any hook can return it second: `return nil, err`.
+
+maki then treats it like a native provider's failure. A 429 or a 5xx is
+retried, `retry-after` sets the wait, and the user sees the same message.
+A hook that raises instead fails as a broken hook.
+
+{res} fields:
+  `status` (integer) Required. The HTTP status.
+  `body` (string) Required. The response body, kept as the error message.
+  `headers` (table) Header name to value, matched case-insensitively. Only
+          `retry-after` is read.
+
+**Parameters:**
+
+- `{res}` (`table`) A response from `maki.net.request`.
+
+**Returns:** (`userdata`) A `ProviderError`. Opaque, but `tostring` renders it.
+
+**Example:**
+
+```lua
+fetch_usage = function()
+  local res = assert(maki.net.request(url, { headers = auth.headers }))
+  if res.status ~= 200 then
+    return nil, maki.provider.http_error(res)
+  end
+  return { limits = {} }
+end
 ```
 
 
@@ -6819,6 +6883,63 @@ function M.tail(text, n)
 --- placeholder to drop. {reason} is a cancel-hook reason ("cancelled" |
 --- "timeout").
 function M.cut(view, out, reason, timeout_secs)
+```
+
+### `require("maki.provider_parse")`
+
+```lua
+-- Rust parity for provider plugins that port a bespoke Rust parser. The Rust
+-- side reads JSON with serde_json and prints with `format!`, and these helpers
+-- reproduce its numbers bit for bit. Other plugins are better off with
+-- `maki.json`.
+--
+-- Luau has a single number type, so `maki.json.decode` gives `8192` and
+-- `8192.0` the same value, while serde_json's `as_u64` accepts only the first.
+-- `M.decode` remembers which numbers were floats in the source text, and the
+-- readers take the container and key (`M.as_u32(m, "context_length")` mirrors
+-- `m["context_length"].as_u64().and_then(|v| u32::try_from(v).ok())`). A
+-- missing key, a JSON null, a non-table container or the wrong type reads as
+-- nil. Tables that did not come from `M.decode` carry no float marks, so there
+-- a whole-valued float passes as an integer.
+--
+-- Luau numbers are doubles: a u64 above 2^53 comes back rounded, and
+-- u64::MAX reads as 2^64.
+
+--- `maki.json.decode`, plus a record of which numbers serde_json would read
+--- as floats. Returns the value, or nil and an error.
+function M.decode(text)
+
+--- serde_json `Value::as_u64` on `tbl[key]`: a non-negative integer, never a
+--- float such as `1.0`, `1e3` or `-0`.
+function M.as_u64(tbl, key)
+
+--- `as_u64` then `u32::try_from(v).ok()`.
+function M.as_u32(tbl, key)
+
+--- serde_json `Value::as_f64` on `tbl[key]`: any number, integer or float.
+function M.as_f64(tbl, key)
+
+--- Rust `s.parse::<f64>().ok()`: no whitespace, no hex, an optional sign,
+--- and `inf`, `infinity` or `nan` in any case. nil for a non-string.
+function M.parse_f64(s)
+
+--- Rust `x as u64`: truncates, NaN and negatives give 0, saturates at the top.
+function M.cast_u64(x)
+
+--- Rust `x as u32`: truncates, NaN and negatives give 0, saturates at the top.
+function M.cast_u32(x)
+
+--- Rust `f64::round`: halves round away from zero.
+M.round = math.round
+
+--- Rust `format!("{:.n$}", x)`: the exact binary value rounded, ties to even,
+--- so `0.125` prints `0.12`. A whole number with `n = 0` prints like Rust's
+--- integer `{}`.
+function M.fixed(x, n)
+
+--- Rust `sort_by`, in place: stable, so elements that are not `less` than
+--- each other keep their order. `less(a, b)` is true when `a` sorts first.
+function M.stable_sort_by(list, less)
 ```
 
 ### `require("maki.scroll")`

@@ -389,6 +389,7 @@ pub mod fixtures {
     const TOOL_OUTPUT: &str = "contents of a.txt";
     const FOLLOW_UP: &str = "now read b.txt";
 
+    const BALANCE_UNAUTHORIZED_BODY: &str = r#"{"error":{"message":"Authentication Fails, Your api key: ****abcd is invalid","type":"authentication_error","param":null,"code":"invalid_request_error"}}"#;
     const BALANCE_BODY: &str = r#"{"is_available":true,"balance_infos":[{"currency":"USD","total_balance":"12.34","granted_balance":"2.00","topped_up_balance":"10.34"},{"currency":"CNY","total_balance":"88.00","granted_balance":"0.00","topped_up_balance":"88.00"}]}"#;
 
     const SUCCESS_TRANSCRIPT: &str = r#"data: {"choices":[{"delta":{"reasoning_content":"weighing the options"}}]}
@@ -433,6 +434,14 @@ data: [DONE]
     pub const BALANCE: Fixture = Fixture {
         name: "user_balance",
         script: &[Canned::json(200, BALANCE_BODY)],
+        thinking: ThinkingConfig::Off,
+        session: None,
+    };
+    /// A refused balance request. Both authorings must fail with the same `Api`
+    /// error, so the plugin cannot pass by calling it a broken hook.
+    pub const USER_BALANCE_UNAUTHORIZED: Fixture = Fixture {
+        name: "user_balance_unauthorized",
+        script: &[Canned::json(401, BALANCE_UNAUTHORIZED_BODY)],
         thinking: ThinkingConfig::Off,
         session: None,
     };
@@ -546,9 +555,11 @@ mod replay_tests {
     }
 
     /// The golden pins the origin the balance request goes to, which is the one
-    /// thing the port changed about it, see [`super::Balance`].
-    #[test]
-    fn the_declaration_reads_the_balance_endpoint() {
-        replay::declared_usage(replay::rust_authoring, SLUG, &BALANCE);
+    /// thing the port changed about it, see [`super::Balance`], and the error a
+    /// refused request fails with.
+    #[test_case(&BALANCE ; "balance")]
+    #[test_case(&USER_BALANCE_UNAUTHORIZED ; "unauthorized")]
+    fn the_declaration_reads_the_balance_endpoint(fixture: &Fixture) {
+        replay::declared_usage(replay::rust_authoring, SLUG, fixture);
     }
 }

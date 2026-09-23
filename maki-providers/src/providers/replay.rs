@@ -616,6 +616,14 @@ fn pretty(value: &Value) -> String {
     serde_json::to_string_pretty(value).expect(NOT_AN_OBJECT)
 }
 
+/// Sends the observation through text once, the same trip the golden file
+/// takes. serde_json is built without `float_roundtrip`, so
+/// `0.024999999999999998` reads back as `0.025`, and a float could otherwise
+/// differ from its own recording.
+fn through_text(observed: &Value) -> Value {
+    serde_json::from_str(&observed.to_string()).expect(NOT_AN_OBJECT)
+}
+
 /// The observation as an artifact on disk: the same file whatever else was in
 /// the build.
 ///
@@ -668,7 +676,7 @@ fn sorted(value: &Value) -> Value {
 /// provider did and never which crates the test binary was linked against.
 fn assert_golden(provider: &str, fixture: &Fixture, observed: &Value) {
     let path = golden_path(provider, fixture.name);
-    let observed = canonical_observation(observed);
+    let observed = canonical_observation(&through_text(observed));
     if std::env::var(UPDATE_ENV).is_ok_and(|value| value == UPDATE_ON) {
         std::fs::create_dir_all(path.parent().expect(NO_GOLDEN_DIR)).expect(WRITE_FAILED);
         std::fs::write(&path, pretty(&observed) + "\n").expect(WRITE_FAILED);

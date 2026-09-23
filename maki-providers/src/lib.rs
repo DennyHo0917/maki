@@ -39,7 +39,10 @@ pub use providers::{KeyHeader, KeyPool, KeyRotation, ResolvedAuth};
 /// and it has to answer to these goldens too.
 #[cfg(any(test, feature = "test-support"))]
 pub use providers::{
-    deepseek::fixtures as deepseek_fixtures, replay, synthetic::fixtures as synthetic_fixtures,
+    deepseek::fixtures as deepseek_fixtures, mistral::fixtures as mistral_fixtures,
+    openrouter::fixtures as openrouter_fixtures, regolo::fixtures as regolo_fixtures, replay,
+    requesty::fixtures as requesty_fixtures, synthetic::fixtures as synthetic_fixtures,
+    tensorx::fixtures as tensorx_fixtures,
 };
 pub use tokens::{ContextGauge, estimate_message_tokens, estimate_prompt_tokens};
 pub use types::{

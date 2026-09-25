@@ -1494,6 +1494,7 @@ mod tests {
     #[test_case("openai/gpt-99", "openai", "gpt-99" ; "unknown_openai_model_accepted")]
     #[test_case("xai/grok-99", "xai", "grok-99" ; "unknown_xai_model_accepted")]
     #[test_case("synthetic/hf:nonexistent", "synthetic", "hf:nonexistent" ; "unknown_synthetic_model_accepted")]
+    #[test_case("api-route/gpt-99", "api-route", "gpt-99" ; "unknown_api_route_model_accepted")]
     #[test_case("ollama/my-custom-model", "ollama", "my-custom-model" ; "unknown_ollama_model_accepted")]
     #[test_case("deepseek/my-custom-model", "deepseek", "my-custom-model" ; "unknown_deepseek_model_accepted")]
     fn unknown_model_accepted(spec: &str, expected_slug: &str, expected_id: &str) {

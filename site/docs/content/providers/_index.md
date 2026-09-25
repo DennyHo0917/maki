@@ -234,6 +234,13 @@ Defaults: deepseek-flash (medium), deepseek-v4-pro (strong)
 
 OpenRouter aggregates models from many providers behind a single API key. Browse available models at [openrouter.ai/models](https://openrouter.ai/models). Use any model ID directly (e.g. `openrouter/anthropic/claude-sonnet-4`).
 
+### API Route
+
+- **Env var**: `API_ROUTE_API_KEY`
+- **API**: `https://global.api-route.com/v1`
+
+API Route lists models available to your key from its API. Use their model IDs with the `api-route/` prefix (e.g. `api-route/gpt-4o-mini`).
+
 ### Requesty
 
 - **Env var**: `REQUESTY_API_KEY`
@@ -514,7 +521,7 @@ To add a custom provider or proxy, drop an executable script into the config `pr
 
 `resolve` is called each time a new agent spawns, so scripts should read tokens from disk instead of caching them in memory. That way auth changes from other processes get picked up.
 
-The `base` field specifies which built-in provider to inherit the model catalog from. Valid values: `anthropic`, `openai`, `google`, `copilot`, `ollama`, `llama-cpp`, `mistral`, `zai`, `deepseek`, `openrouter`, `requesty`, `synthetic`, `regolo`, `tensorx`, `opencode`, `xai`, `aperture`.
+The `base` field specifies which built-in provider to inherit the model catalog from. Valid values: `anthropic`, `openai`, `google`, `copilot`, `ollama`, `llama-cpp`, `mistral`, `zai`, `deepseek`, `openrouter`, `api-route`, `requesty`, `synthetic`, `regolo`, `tensorx`, `opencode`, `xai`, `aperture`.
 
 If your provider serves models not in the base catalog, add a `models` subcommand returning:
 

@@ -8,9 +8,9 @@ use crate::model::{ModelEntry, ModelFamily, ModelTier};
 use crate::pricing::PricingSchedule;
 use crate::provider::Provider;
 use crate::providers::{
-    ResolvedAuth, Timeouts, anthropic, aperture, copilot, custom, deepseek, dynamic, google,
-    llama_cpp, mistral, ollama, openai, opencode, openrouter, regolo, requesty, synthetic, tensorx,
-    xai, zai,
+    ResolvedAuth, Timeouts, anthropic, aperture, api_route, copilot, custom, deepseek, dynamic,
+    google, llama_cpp, mistral, ollama, openai, opencode, openrouter, regolo, requesty, synthetic,
+    tensorx, xai, zai,
 };
 
 /// Stands in for the model table when a provider curates none.
@@ -181,6 +181,7 @@ const BUILTINS: &[ProviderSpec] = &[
     zai::SPEC,
     deepseek::SPEC,
     openrouter::SPEC,
+    api_route::SPEC,
     requesty::SPEC,
     synthetic::SPEC,
     regolo::SPEC,
